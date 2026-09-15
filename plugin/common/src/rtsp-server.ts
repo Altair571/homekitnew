@@ -925,6 +925,18 @@ export class RtspServer {
     setupTracks: {
         [trackId: string]: RtspTrack;
     } = {};
+    // r43: interleaved channel -> track, so reading a packet does not walk the
+    // track list. Rebuilt on a miss and cleared by SETUP, so a track added or
+    // replaced later is still found.
+    private interleavedTracks: Map<number, RtspTrack> | undefined;
+
+    private trackForDestination(destination: number) {
+        const cached = this.interleavedTracks?.get(destination);
+        if (cached)
+            return cached;
+        this.interleavedTracks = new Map(Object.values(this.setupTracks).map(track => [track.destination, track]));
+        return this.interleavedTracks.get(destination);
+    }
 
     constructor(public client: Duplex, public sdp?: string, public udp?: boolean, public checkRequest?: (method: string, url: string, headers: Headers, rawMessage: string[]) => Promise<boolean>) {
         this.session = randomBytes(4).toString('hex');
@@ -975,7 +987,7 @@ export class RtspServer {
             const packet = await readLength(this.client, length);
             const id = header.readUInt8(1);
             const destination = id - (id % 2);
-            const track = Object.values(this.setupTracks).find(track => track.destination === destination);
+            const track = this.trackForDestination(destination);
             if (!track)
                 throw new Error('RSTP Server received unknown channel: ' + id);
 
@@ -1052,6 +1064,7 @@ export class RtspServer {
             destination: low,
             codec: msection.codec,
         }
+        this.interleavedTracks = undefined;
     }
 
 
@@ -1104,6 +1117,7 @@ export class RtspServer {
                 rtp: rtpServer.server,
                 rtcp: rtcpServer.server,
             }
+            this.interleavedTracks = undefined;
             transport = transport.replace('RTP/AVP/UDP', 'RTP/AVP').replace('RTP/AVP', 'RTP/AVP/UDP');
             transport += `;server_port=${rtpServer.port}-${rtcpServer.port}`;
         }

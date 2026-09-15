@@ -38,15 +38,22 @@ export function createFrameMarkingProbe(session: any) {
         }
         accepted = [...new Set(accepted)]; return accepted;
     };
+    // r43: werift rebuilds the entire remote SDP string on every pc.remoteDescription
+    // read, so resolving this once per access unit replaces one full SDP serialization
+    // per outgoing RTP packet. The extension IDs can only change with a new
+    // description, which restarts media and is observed on the next frame.
+    let current: number[] | undefined;
+    const refresh = () => current = negotiation();
     return {
         observeFrame(frame: Buffer, header: any) {
             timestamp = header.timestamp; independent = independentHevcFrame(frame);
             counts.sourceFrames++;
             if (independent === undefined) counts.unsupportedFrames++;
             else if (independent) counts.independentFrames++;
+            refresh();
         },
         decorate(packet: any) {
-            const ids = negotiation();
+            const ids = current ?? refresh();
             if (!ids.length) { counts.unnegotiatedPackets++; return; }
             if (packet.header.timestamp !== timestamp || independent === undefined || !packet.payload.length) {
                 counts.metadataMissingPackets++; return;
@@ -63,7 +70,7 @@ export function createFrameMarkingProbe(session: any) {
             if (bits & 32) counts.markedIndependentPackets++;
         },
         snapshot() {
-            const ids = negotiation();
+            const ids = refresh();
             return { revision: 36, experiment: 'negotiated-frame-marking',
                 negotiated: !!ids.length, extensionIds: [...ids], ...counts };
         },
