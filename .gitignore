@@ -1,0 +1,10 @@
+node_modules
+dist/
+dist-*/
+*.zip
+diagnostics/
+sample-hevc.mp4
+__pycache__/
+*.pyc
+*.logarchive
+.DS_Store
