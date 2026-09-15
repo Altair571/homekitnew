@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 *.logarchive
 .DS_Store
+
+# Per-release assets, generated beside the ZIP by the packaging steps in README.md
+Install-Scrypted-Plugin-r*.command
+SHA256SUMS-r*.txt

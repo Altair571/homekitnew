@@ -127,6 +127,17 @@ PY
 python3 build-r43-from-r42.py --package
 ```
 
+The release's other two assets are copies of what the packaging step pinned, so they
+are generated rather than committed:
+
+```bash
+cp "Install Scrypted Plugin.command" Install-Scrypted-Plugin-r43.command
+sha256sum plugin-hevc-webrtc-r43.zip Install-Scrypted-Plugin-r43.command > SHA256SUMS-r43.txt
+```
+
+Upload those two and the ZIP to the release, with `r43-release-notes.md` as its
+description.
+
 To run the suite against an earlier release instead, unzip its bundle into `dist/`
 and point `HK_TEST_BUNDLE` at it.
 
