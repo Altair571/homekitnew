@@ -58,7 +58,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_exact_release_archive(self):
         data, build, digest = app.read_plugin(ROOT / app.DEFAULT_ZIP)
-        self.assertEqual(build, os.environ.get('HK_INSTALLER_BUILD', 'hevc-fixes-2026-09-16-r42'))
+        self.assertEqual(build, os.environ.get('HK_INSTALLER_BUILD', 'hevc-fixes-2026-09-16-r43'))
         self.assertEqual(digest, app.DEFAULT_SHA256)
         self.assertGreater(len(data), 2_000_000)
 
