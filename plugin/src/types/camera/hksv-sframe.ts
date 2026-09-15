@@ -59,10 +59,15 @@ export class SFrameEncryptor {
         if (plaintext.length > MAX_FRAME || metadata.length > 64) throw new Error('SFrame frame too large');
         // Consume before encryption: an error must never allow nonce reuse.
         const counter = this.counter++, header = sframeHeader(this.kid, counter);
-        const nonce = Buffer.from(this.salt), ctr = uint64(counter);
-        for (let i = 0; i < 8; ++i) nonce[i + 4] ^= ctr[i];
-        const cipher = createCipheriv('aes-256-ctr', this.key.subarray(0, 32), Buffer.concat([nonce, Buffer.alloc(4)]));
-        const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+        // r43: build the 16-byte counter block in place; its first 12 bytes are the nonce.
+        const block = Buffer.alloc(16); this.salt.copy(block); const ctr = uint64(counter);
+        for (let i = 0; i < 8; ++i) block[i + 4] ^= ctr[i];
+        const nonce = block.subarray(0, 12);
+        const cipher = createCipheriv('aes-256-ctr', this.key.subarray(0, 32), block);
+        // r43: AES-CTR is a stream cipher, so final() is empty and update() already
+        // returned the whole ciphertext. Concatenating copied every frame again.
+        const head = cipher.update(plaintext), tail = cipher.final();
+        const ciphertext = tail.length ? Buffer.concat([head, tail]) : head;
         const tag = createHmac('sha512', this.key.subarray(32))
             .update(uint64(BigInt(header.length + metadata.length)))
             .update(uint64(BigInt(ciphertext.length)))
@@ -96,10 +101,12 @@ export class HevcAccessUnitAssembler {
         this.nals = []; this.fragments = this.fragmentHeader = undefined;
         this.size = 0; this.damaged = false;
     }
-    private add(nal: Buffer): void {
+    /** r43: `owned` marks a buffer this assembler allocated itself, so a defragmented
+     * FU is kept as is instead of being copied a second time. */
+    private add(nal: Buffer, owned = false): void {
         if (nal.length < 2 || (nal[0] & 128) || !(nal[1] & 7) || ((nal[0] >> 1) & 63) >= 48)
             throw new Error('Invalid HEVC NAL');
-        this.nals.push(Buffer.from(nal));
+        this.nals.push(owned ? nal : Buffer.from(nal));
     }
     push(packet: RtpPacket): Buffer | undefined {
         const h = packet.header, p = packet.payload;
@@ -122,7 +129,7 @@ export class HevcAccessUnitAssembler {
                     }
                     if (!this.fragments || !header.equals(this.fragmentHeader)) throw new Error('Missing HEVC FU');
                     this.fragments.push(Buffer.from(p.subarray(3)));
-                    if (p[2] & 64) { this.add(Buffer.concat(this.fragments)); this.fragments = this.fragmentHeader = undefined; }
+                    if (p[2] & 64) { this.add(Buffer.concat(this.fragments), true); this.fragments = this.fragmentHeader = undefined; }
                 }
                 else {
                     if (this.fragments) throw new Error('Incomplete HEVC FU');
@@ -145,9 +152,16 @@ export class HevcAccessUnitAssembler {
         if (!h.marker) return;
         let frame: Buffer | undefined;
         if (!this.damaged && !this.fragments && this.nals.length) {
-            const chunks: Buffer[] = [];
-            for (const nal of this.nals) { const length = Buffer.alloc(4); length.writeUInt32BE(nal.length); chunks.push(length, nal); }
-            frame = Buffer.concat(chunks);
+            // r43: size the access unit once and write the 4-byte lengths in place,
+            // instead of a length buffer per NAL and a list twice as long as the frame.
+            let total = 0;
+            for (const nal of this.nals) total += nal.length + 4;
+            frame = Buffer.allocUnsafe(total);
+            let offset = 0;
+            for (const nal of this.nals) {
+                frame.writeUInt32BE(nal.length, offset); offset += 4;
+                nal.copy(frame, offset); offset += nal.length;
+            }
         }
         this.clearFrame();
         // A second packet with the same completed timestamp cannot form a new AU.
@@ -181,7 +195,11 @@ export class SFrameRtpSender {
         const limit = this.maxSlice;
         for (let offset = 0; offset < encrypted.length; offset += limit) {
             const end = offset + limit >= encrypted.length;
-            const payload = Buffer.concat([Buffer.from([(offset === 0 ? 128 : 0) | (end ? 64 : 0)]), encrypted.subarray(offset, offset + limit)]);
+            // r43: one allocation and one copy per slice.
+            const slice = Math.min(limit, encrypted.length - offset);
+            const payload = Buffer.allocUnsafe(slice + 1);
+            payload[0] = (offset === 0 ? 128 : 0) | (end ? 64 : 0);
+            encrypted.copy(payload, 1, offset, offset + slice);
             packets.push(new RtpPacket(new RtpHeader({ version: 2, payloadType: packet.header.payloadType,
                 timestamp: packet.header.timestamp, ssrc: this.ssrc, sequenceNumber: this.sequence++ & 65535,
                 marker: this.video ? end : packet.header.marker }), payload));

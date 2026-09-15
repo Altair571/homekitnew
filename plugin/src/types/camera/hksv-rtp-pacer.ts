@@ -10,7 +10,8 @@ export function createHksvRtpPacer(send: (packet: RtpPacket) => void, fail: (err
     burstBytes?: number;
     maxQueueBytes?: number;
 }) {
-    const now = options?.now ?? (() => Number(process.hrtime.bigint()) / 1e6);
+    // r43: the same monotonic clock without a BigInt allocation on every packet.
+    const now = options?.now ?? (() => performance.now());
     const schedule = options?.schedule ?? setTimeout;
     const unschedule = options?.unschedule ?? clearTimeout;
     const bytesPerMs = (options?.bytesPerSecond ?? 5_000_000) / 1000; // 40 Mbps, well above the 4K target.

@@ -8,6 +8,12 @@ import sdk from '@scrypted/sdk';
 
 type Kind = 'video' | 'audio';
 const MAX_FRAME = 1024 * 1024;
+/** r43: independently authenticating, decrypting and digesting every datagram costs
+ * about as much per packet as sending it, and at 4K that is several percent of the
+ * event loop for the life of the session. Verification is a startup question, so it
+ * runs for a bounded number of packets per stream; the free header, sequence, report
+ * and timing counters continue for the whole session. */
+const VERIFY_PACKETS = 4000;
 const hex = (n: number) => (n >>> 0).toString(16).padStart(8, '0');
 const u64 = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(n); return b; };
 const digest = (b: Buffer) => createHash('sha256').update(b).digest();
@@ -58,7 +64,7 @@ export function createWebRTCMediaProbe(session: any, now: () => number = () => p
     const make = () => ({ inputPackets: 0, inputMarkers: 0, inputSequenceDiscontinuities: 0,
         sourceFrames: 0, sourceBytes: 0, sourceInvalidNalFrames: 0,
         sourceIrapFrames: 0, sourceVpsFrames: 0, sourceSpsFrames: 0, sourcePpsFrames: 0,
-        rtpPackets: 0, udpPackets: 0, srtpVerified: 0, srtpAuthFailures: 0,
+        rtpPackets: 0, udpPackets: 0, srtpVerified: 0, srtpVerifySkipped: 0, srtpAuthFailures: 0,
         srtpPayloadMatches: 0, srtpPayloadMismatches: 0, srtpExpectedMissing: 0,
         srtpUnsupported: 0, srtpParseFailures: 0, sequenceDiscontinuities: 0,
         duplicateOrLatePackets: 0, sframeFrames: 0, sframeSampled: 0,
@@ -333,35 +339,45 @@ export function createWebRTCMediaProbe(session: any, now: () => number = () => p
         if (last !== undefined && index - last > 32768) index -= 65536;
         else if (last !== undefined && last - index > 32768) index += 65536;
         if (index < 0) { s.srtpParseFailures++; return; }
-        const roc = Buffer.alloc(4); roc.writeUInt32BE(Math.floor(index / 65536));
-        let plaintext: Buffer;
-        if (c.profile === 7) {
-            const iv = Buffer.alloc(12); iv.writeUInt32BE(ssrc, 2); iv.writeUInt32BE(Math.floor(index / 65536), 6); iv.writeUInt16BE(seq, 10);
-            for (let i = 0; i < 12; i++) iv[i] ^= c.salt[i];
-            const d = createDecipheriv('aes-128-gcm', c.enc, iv);
-            d.setAAD(data.subarray(0, offset)); d.setAuthTag(data.subarray(-16));
-            try { plaintext = Buffer.concat([d.update(data.subarray(offset, -16)), d.final()]); }
-            catch (_) { s.srtpAuthFailures++; return; }
-        } else {
-            const tag = createHmac('sha1', c.auth).update(data.subarray(0, -c.tagLength)).update(roc).digest().subarray(0, c.tagLength);
-            if (!equal(tag, data.subarray(-c.tagLength))) { s.srtpAuthFailures++; return; }
-            const iv = Buffer.alloc(16); c.salt.copy(iv);
-            const xor = Buffer.alloc(16); xor.writeUInt32BE(ssrc, 4); xor.writeUIntBE(index, 8, 6);
-            for (let i = 0; i < 16; i++) iv[i] ^= xor[i];
-            const d = createDecipheriv('aes-128-ctr', c.enc, iv);
-            plaintext = Buffer.concat([d.update(data.subarray(offset, -c.tagLength)), d.final()]);
+        // r43: everything above reads the cleartext SRTP header and runs for every
+        // packet of the session. The independent authentication, decryption and
+        // digests below stop once this stream has verified its startup budget.
+        const verify = s.udpPackets <= VERIFY_PACKETS;
+        let plaintext: Buffer | undefined;
+        if (!verify) s.srtpVerifySkipped++;
+        else {
+            const roc = Buffer.alloc(4); roc.writeUInt32BE(Math.floor(index / 65536));
+            if (c.profile === 7) {
+                const iv = Buffer.alloc(12); iv.writeUInt32BE(ssrc, 2); iv.writeUInt32BE(Math.floor(index / 65536), 6); iv.writeUInt16BE(seq, 10);
+                for (let i = 0; i < 12; i++) iv[i] ^= c.salt[i];
+                const d = createDecipheriv('aes-128-gcm', c.enc, iv);
+                d.setAAD(data.subarray(0, offset)); d.setAuthTag(data.subarray(-16));
+                try { plaintext = Buffer.concat([d.update(data.subarray(offset, -16)), d.final()]); }
+                catch (_) { s.srtpAuthFailures++; return; }
+            } else {
+                const tag = createHmac('sha1', c.auth).update(data.subarray(0, -c.tagLength)).update(roc).digest().subarray(0, c.tagLength);
+                if (!equal(tag, data.subarray(-c.tagLength))) { s.srtpAuthFailures++; return; }
+                const iv = Buffer.alloc(16); c.salt.copy(iv);
+                const xor = Buffer.alloc(16); xor.writeUInt32BE(ssrc, 4); xor.writeUIntBE(index, 8, 6);
+                for (let i = 0; i < 16; i++) iv[i] ^= xor[i];
+                const d = createDecipheriv('aes-128-ctr', c.enc, iv);
+                plaintext = Buffer.concat([d.update(data.subarray(offset, -c.tagLength)), d.final()]);
+            }
         }
-        c.indexes.set(ssrc, Math.max(last ?? index, index)); s.srtpVerified++;
+        c.indexes.set(ssrc, Math.max(last ?? index, index));
+        if (verify) s.srtpVerified++;
         try {
             let payload = plaintext;
-            if (data[0] & 32) {
+            if (payload && (data[0] & 32)) {
                 const n = payload[payload.length - 1];
                 if (!n || n > payload.length) { s.srtpParseFailures++; return; }
                 payload = payload.subarray(0, -n);
             }
-            const expected = st.expected.get(seq);
-            if (!expected) s.srtpExpectedMissing++;
-            else if (equal(expected, digest(payload))) s.srtpPayloadMatches++; else s.srtpPayloadMismatches++;
+            if (payload) {
+                const expected = st.expected.get(seq);
+                if (!expected) s.srtpExpectedMissing++;
+                else if (equal(expected, digest(payload))) s.srtpPayloadMatches++; else s.srtpPayloadMismatches++;
+            }
             st.sequences[seq] = 1;
             if (st.lastIndex !== undefined) {
                 if (index <= st.lastIndex) s.duplicateOrLatePackets++;
@@ -370,8 +386,8 @@ export function createWebRTCMediaProbe(session: any, now: () => number = () => p
             if (st.lastIndex !== undefined && index <= st.lastIndex) return; // Retransmission is not a second SFrame.
             st.lastIndex = index;
             s.firstSequence ??= seq; s.lastSequence = seq; s.firstUdpAtMs ??= elapsed(); s.lastUdpAtMs = elapsed();
-            sframe(kind, payload, { ssrc, sequenceNumber: seq, timestamp: data.readUInt32BE(4), marker: !!(data[1] & 128) });
-        } finally { plaintext.fill(0); }
+            if (payload) sframe(kind, payload, { ssrc, sequenceNumber: seq, timestamp: data.readUInt32BE(4), marker: !!(data[1] & 128) });
+        } finally { plaintext?.fill(0); }
     }
 
     function attachCrypto(dtls: any) {
@@ -462,7 +478,10 @@ export function createWebRTCMediaProbe(session: any, now: () => number = () => p
         observeRtp(kind: Kind, payload: Buffer, header: any) {
             safely(() => {
                 const s = stats[kind]; s.rtpPackets++;
-                boundedSet(state[kind].expected, header.sequenceNumber, digest(payload));
+                // r43: the wire side verifies the same budget and always after this
+                // call for the same packet, so a small margin keeps every verified
+                // datagram's source digest available.
+                if (s.rtpPackets <= VERIFY_PACKETS + 64) boundedSet(state[kind].expected, header.sequenceNumber, digest(payload));
                 const identity = { ssrc: hex(header.ssrc), payloadType: header.payloadType,
                     timestamp: header.timestamp >>> 0, sequence: header.sequenceNumber,
                     marker: !!header.marker, extensionIds: (header.extensions ?? []).slice(0, 8).map((e: any) => e.id) };
@@ -484,7 +503,8 @@ export function createWebRTCMediaProbe(session: any, now: () => number = () => p
                 : audio.reportBlocks ? 'peer-reports-audio-only'
                 : 'no-peer-reception-reports-observed';
             return { revision: 35, elapsedMs: elapsed(), utc: new Date().toISOString(), evidence,
-                sampling: 'first-12-frames-then-one-per-5s-per-media', maxFrameBytes: MAX_FRAME,
+                sampling: 'first-12-frames-then-one-per-5s-per-media', verifiedPacketsPerStream: VERIFY_PACKETS,
+                maxFrameBytes: MAX_FRAME,
                 srtpVerifier: 'independent-aes128-cm-sha1-and-aes128-gcm',
                 sframeKeyId: session.sframeConfiguration?.kid?.toString(16).padStart(16, '0'),
                 video: copy(video), audio: copy(audio), decoder: copy(decoder), rtcp: copy(raw), reportSamples: copy(reports), unknownReportSamples: copy(unknownReports) };

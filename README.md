@@ -6,18 +6,22 @@ A patched build of the [Scrypted](https://github.com/koush/scrypted) HomeKit plu
 
 ## Status
 
-**r42 is the current known-working release.**
+**r42 is the current known-working release. r43 is prepared but not yet packaged.**
 
-| Scenario | r42 |
-| --- | --- |
-| Live view at home (Multi-Tier RTP, native HEVC up to 4K) | Works |
-| Live view away from home at the default 360p (WebRTC through Apple's relay) | Works, with video and audio |
-| 1080p away from home | Works: re-encoded at 4 Mbps |
-| 4K away from home | Works: the camera's own 4K HEVC stream, sent without re-encoding |
-| 1440p away from home | Untested |
-| Talkback from the Home app | Not played on the camera |
-| HomeKit Secure Video recording | Not verified |
-| iOS 27 CMAF direct upload | Not working |
+| Scenario | r42 (known working) | r43 (prepared) |
+| --- | --- | --- |
+| Live view at home (Multi-Tier RTP, native HEVC up to 4K) | Works | Unchanged |
+| Live view away from home at the default 360p (WebRTC through Apple's relay) | Works, with video and audio | Unchanged |
+| 1080p away from home | Works: re-encoded at 4 Mbps | Unchanged |
+| 4K away from home | Works: the camera's own 4K HEVC stream, sent without re-encoding | Unchanged |
+| 1440p away from home | Untested | Untested |
+| Talkback from the Home app | Not played on the camera | Not played on the camera |
+| HomeKit Secure Video recording | Not verified | Not verified |
+| iOS 27 CMAF direct upload | Not working | Not working |
+
+r43 sends exactly what r42 sends. It only removes work the plugin was doing per
+packet on its own event loop: about half of it at 4K. See
+[R43-TESTING.md](R43-TESTING.md).
 
 ## Install
 
@@ -33,7 +37,7 @@ A patched build of the [Scrypted](https://github.com/koush/scrypted) HomeKit plu
 4. In the camera's HomeKit settings, enable **Experimental: HEVC / 4K Streaming and HKSV (iOS/tvOS 27+)**.
 5. Optional: choose the remote quality with **Experimental: WebRTC Remote Resolution (r42)** and **Experimental: WebRTC Remote Video Bitrate (r42)**. 360p is the default.
 
-Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md`, `R41-TESTING.md`, `R42-TESTING.md`) describes what to check after installing.
+Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md`, `R41-TESTING.md`, `R42-TESTING.md`, `R43-TESTING.md`) describes what to check after installing.
 
 ## How remote HEVC works
 
@@ -62,27 +66,68 @@ r42 adds remote quality options:
 
 A camera stream sent unchanged starts, and recovers from loss, at the camera's own keyframes. Setting the camera's I-frame interval to 1–2 seconds makes 4K start faster.
 
+r43 changes none of that. It removes per-packet work from the send path:
+- The frame-marking probe resolved its negotiated extension IDs once per RTP packet, and each of those reads made werift re-serialize the whole remote SDP. It now resolves them once per frame.
+- The media probe independently decrypted and re-hashed every datagram for the life of the session. It now does that for the first 4000 packets of each stream, which is where a fault would show, and keeps its free counters for the whole session.
+- SFrame encryption and HEVC assembly drop two full-frame copies, and reading an RTSP packet no longer walks the track list.
+
+Replaying 10 s of HEVC through the real send path, that is 12.3% of one core down to 6.0% at 4K, 5.1% to 3.6% at 1080p, and 2.3% to 2.0% at 360p.
+
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `plugin/` | Plugin source exactly as shipped in the latest build (r42), taken from the release bundle's source map |
+| `plugin/` | Plugin source exactly as the latest build (r43) contains it. `build-r43-from-r42.py` asserts the two match. |
 | `tests/` | Node test suite that runs against a built bundle, plus the installer tests |
-| `build-r39-from-r38.py` … `build-r42-from-r41.py` | Incremental release builders. Each patches the previous checksum-locked release ZIP. |
+| `build-r39-from-r38.py` … `build-r43-from-r42.py` | Incremental release builders. Each patches the previous checksum-locked release ZIP. |
 | `build-r35-from-r34.py` | Shared helpers the builders import |
-| `Install Scrypted Plugin.command` | The installer for the latest build (r42) |
-| `R39-TESTING.md` … `R42-TESTING.md` | Release notes and test steps |
+| `Install Scrypted Plugin.command` | The installer for the latest release (r42) |
+| `R39-TESTING.md` … `R43-TESTING.md` | Release notes and test steps |
 
-## Running the tests
+## Building and testing r43
 
-This needs Node.js and Python 3. The tests match the latest build, so download `plugin-hevc-webrtc-r42.zip` from the r42 release into the repository root first.
+r43 is prepared but not packaged: no release ZIP exists yet, so the installer above
+still carries r42. Building it needs Node.js and Python 3, and the checksum-locked
+`plugin-hevc-webrtc-r42.zip` from the r42 release in the repository root.
 
 ```bash
 npm ci
-mkdir -p dist && unzip -o plugin-hevc-webrtc-r42.zip main.nodejs.js main.nodejs.js.map -d dist
-HK_TEST_BUNDLE=dist/main.nodejs.js node --test tests/*.test.cjs
+curl -LO https://github.com/Altair571/homekitnew/releases/download/r42/plugin-hevc-webrtc-r42.zip
+python3 build-r43-from-r42.py                     # writes dist-r43/
+HK_TEST_BUNDLE=dist-r43/main.nodejs.js node --test tests/*.test.cjs
 python3 tests/test_installer.py
 ```
+
+`tests/r43-send-path.test.cjs` covers what r43 changed, including a digest of the
+bytes the SFrame sender puts on the wire, which r42 produces too. The rest of the
+suite is r42's and passes unchanged. The two `real WebRTC ICE/DTLS/SRTP carries
+identical HEVC pictures` tests drive a loopback WebRTC session through real ffmpeg;
+they need a host that carries that burst without dropping datagrams, and fail on some
+containers whichever build they are run against.
+
+Packaging is locked to a passing run: `--package` rebuilds the ZIP only if
+`diagnostics/r43-tests.json` records this exact bundle, a zero exit code, and the
+hash of `diagnostics/r43-tests.log`, and only if that log shows no failed or skipped
+test. Record the run, then package:
+
+```bash
+mkdir -p diagnostics
+HK_TEST_BUNDLE=dist-r43/main.nodejs.js node --test tests/*.test.cjs > diagnostics/r43-tests.log; code=$?
+python3 - "$code" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+out = {'bundleSha256': hashlib.sha256(Path('dist-r43/main.nodejs.js').read_bytes()).hexdigest(),
+       'returnCode': int(sys.argv[1]),
+       'logSha256': hashlib.sha256(Path('diagnostics/r43-tests.log').read_bytes()).hexdigest()}
+Path('diagnostics/r43-tests.json').write_text(json.dumps(out, indent=2) + '\n')
+PY
+python3 build-r43-from-r42.py --package
+```
+
+Then update `Install Scrypted Plugin.command` to the new ZIP's name and SHA-256.
+
+To run the suite against the r42 release instead, unzip its bundle into `dist/` and
+point `HK_TEST_BUNDLE` at it.
 
 ## Credits
 

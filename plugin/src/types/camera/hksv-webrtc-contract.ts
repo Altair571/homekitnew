@@ -10,6 +10,7 @@ const FRAME = 'urn:ietf:params:rtp-hdrext:framemarking';
 const OLD_FRAME = 'http://tools.ietf.org/html/draft-ietf-avtext-framemarking-07';
 const DD = 'https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension';
 const directions = ['sendrecv', 'sendonly', 'recvonly', 'inactive'];
+const RECEIVES = ['recvonly', 'sendrecv'];
 const extensionName = (uri: string) => uri === MID ? 'mid' : uri === RID ? 'rid'
     : uri === FRAME || uri === OLD_FRAME ? 'frame-marking' : uri === DD ? 'dependency-descriptor' : 'other';
 
@@ -80,11 +81,23 @@ export function observeWebRTCContract(session: any, localSdp: string, now: () =>
         return remote?.find(m => m.kind === kind && own?.mid !== undefined && m.mid === own.mid)
             ?? remote?.find(m => m.kind === kind);
     };
+    // r43: every RTP packet and every datagram is checked against the same two
+    // descriptions, so resolve the sections and the compared values once per
+    // description instead of rescanning and re-allocating them per packet.
+    let resolved: Record<string, any> = {};
+    const invalidate = () => resolved = {};
+    const resolve = (kind: Kind) => resolved[kind] ??= (() => {
+        const m = section(kind);
+        const recvRids = (m?.rids ?? []).filter(r => r.direction === 'recv').map(r => ({ ...r, key: Buffer.from(r.id) }));
+        return { m, own: local?.find(x => x.kind === kind), mid: Buffer.from(m?.mid ?? ''), recvRids,
+            simulcastRecv: m?.simulcastRecv?.map(r => ({ ...r, key: Buffer.from(r.id) })),
+            recvExtensions: (m?.extensions ?? []).filter(e => RECEIVES.includes(e.direction)) };
+    })();
     const checkHeader = (kind: Kind, header: any, s = stats[kind]) => {
-        const m = section(kind), own = local?.find(m => m.kind === kind);
+        const { m, own, mid, recvRids, simulcastRecv, recvExtensions } = resolve(kind);
         if (!m) { s.noRemoteDescription++; return; }
         if (m.rejected) s.rejectedMedia++;
-        if (!['recvonly', 'sendrecv'].includes(m.direction)) s.directionMismatch++;
+        if (!RECEIVES.includes(m.direction)) s.directionMismatch++;
         if (!m.pts.includes(header.payloadType)) s.payloadTypeMismatch++;
         if (header.ssrc !== session[kind + 'Transceiver']?.sender?.ssrc) s.ssrcMismatch++;
         if (own?.ssrcs.size && !own.ssrcs.has(header.ssrc)) s.ssrcNotInLocalSdp++;
@@ -95,17 +108,16 @@ export function observeWebRTCContract(session: any, localSdp: string, now: () =>
             seen.add(e.id);
             const accepted = m.extensions.find(x => x.id === e.id);
             if (!accepted) { s.unnegotiatedExtension++; continue; }
-            if (!['recvonly', 'sendrecv'].includes(accepted.direction)) s.extensionDirectionMismatch++;
+            if (!RECEIVES.includes(accepted.direction)) s.extensionDirectionMismatch++;
             const value = Buffer.isBuffer(e.payload) ? e.payload : Buffer.from(e.payload ?? []);
-            if (accepted.uri === MID && !value.equals(Buffer.from(m.mid ?? ''))) s.midMismatch++;
+            if (accepted.uri === MID && !value.equals(mid)) s.midMismatch++;
             if (accepted.uri === RID) {
-                const candidates = m.rids.filter(r => r.direction === 'recv');
-                const rid = candidates.find(r => value.equals(Buffer.from(r.id)));
-                if (!candidates.length) s.ridWithoutReceiveDeclaration++;
+                const rid = recvRids.find(r => value.equals(r.key));
+                if (!recvRids.length) s.ridWithoutReceiveDeclaration++;
                 else if (!rid) s.ridMismatch++;
                 if (rid?.pts && !rid.pts.includes(header.payloadType)) s.ridPayloadMismatch++;
-                if (m.simulcastRecv) {
-                    const stream = m.simulcastRecv.find(r => value.equals(Buffer.from(r.id)));
+                if (simulcastRecv) {
+                    const stream = simulcastRecv.find(r => value.equals(r.key));
                     if (!stream) s.ridMismatch++;
                     else if (stream.paused) s.ridPaused++;
                 }
@@ -113,14 +125,14 @@ export function observeWebRTCContract(session: any, localSdp: string, now: () =>
         }
         // These are presence observations, not claims every RTP packet must
         // repeat MID/RID: receivers can learn the SSRC association earlier.
-        for (const e of m.extensions.filter(e => ['recvonly', 'sendrecv'].includes(e.direction))) {
+        for (const e of recvExtensions) {
             if (e.uri === MID && !seen.has(e.id)) s.missingMid++;
-            if (e.uri === RID && m.rids.some(r => r.direction === 'recv') && !seen.has(e.id)) s.missingRid++;
+            if (e.uri === RID && recvRids.length && !seen.has(e.id)) s.missingRid++;
         }
     };
     return {
-        setRemote(sdp: string, type: 'answer' | 'offer') { remote = parse(sdp); role = type; revision++; },
-        setLocal(sdp: string) { local = parse(sdp); },
+        setRemote(sdp: string, type: 'answer' | 'offer') { remote = parse(sdp); role = type; revision++; invalidate(); },
+        setLocal(sdp: string) { local = parse(sdp); invalidate(); },
         observeRtp(kind: Kind, payload: Buffer, header: any) {
             try {
                 const s = stats[kind]; s.checkedRtp++;
