@@ -270,6 +270,8 @@ addSupportedType({
                         } as RequestMediaStreamOptions);
                         return mediaManager.convertMediaObjectToJSON<FFmpegInput>(mediaObject, ScryptedMimeTypes.FFmpegInput);
                     },
+                    // r42: WebRTC checks at offer time whether a camera stream already matches a remote tier.
+                    getWebRTCSourceStreams: () => device.getVideoStreamOptions(),
                     disabledServices: hksv27Disabled,
                     recordingSource: !isRecordingEnabled ? undefined : (tier, signal) =>
                         createHksvRecordingSource(device, console, tier, signal, () =>

@@ -107,5 +107,5 @@ export function installCameraStreamDiagnostics(accessory: Accessory, console: Co
             }
         }
     }
-    writeLog(`HomeKit stream diagnostics build: hevc-fixes-2026-09-16-r41; HEVC option=${hevcEnabled}; legacy RTP=${counts.get('legacy RTP') || 0}; multi-tier RTP=${counts.get('multi-tier RTP') || 0}; WebRTC=${counts.get('WebRTC') || 0}`);
+    writeLog(`HomeKit stream diagnostics build: hevc-fixes-2026-09-16-r42; HEVC option=${hevcEnabled}; legacy RTP=${counts.get('legacy RTP') || 0}; multi-tier RTP=${counts.get('multi-tier RTP') || 0}; WebRTC=${counts.get('WebRTC') || 0}`);
 }

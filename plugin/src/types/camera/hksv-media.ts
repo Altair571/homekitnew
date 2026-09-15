@@ -55,7 +55,8 @@ export interface KeyframeSchedule {
     startupSeconds: number;
 }
 
-export function videoEncoderArguments(codec: CameraVideoCodec, width: number, height: number, fps: number, bitrateKbps: number, keyframes?: KeyframeSchedule): string[] {
+/** r42: 'auto' lets x265 size its own thread pool; the default keeps the two threads every earlier build used. */
+export function videoEncoderArguments(codec: CameraVideoCodec, width: number, height: number, fps: number, bitrateKbps: number, keyframes?: KeyframeSchedule, options?: { threads?: 'limited' | 'auto' }): string[] {
     const bitrate = Math.max(64, Math.round(bitrateKbps)) * 1000;
     const gop = Math.max(1, Math.round(fps * (keyframes?.gopSeconds ?? 2)));
     return [
@@ -65,7 +66,7 @@ export function videoEncoderArguments(codec: CameraVideoCodec, width: number, he
         '-bf', '0', '-g', String(gop), '-keyint_min', String(gop),
         ...(keyframes ? ['-forced-idr', '1', '-force_key_frames', `expr:lte(t,${keyframes.startupSeconds})*gte(t,n_forced*${keyframes.startupIntervalSeconds})`] : []),
         ...(codec === 'h264' ? ['-sc_threshold', '0'] : []),
-        ...(codec === 'h265' ? ['-x265-params', `repeat-headers=1:aud=1:bframes=0:open-gop=0:scenecut=0:keyint=${gop}:min-keyint=${gop}:pools=2:frame-threads=2:log-level=error`] : ['-x264-params', 'repeat-headers=1:scenecut=0']),
+        ...(codec === 'h265' ? ['-x265-params', `repeat-headers=1:aud=1:bframes=0:open-gop=0:scenecut=0:keyint=${gop}:min-keyint=${gop}${options?.threads === 'auto' ? '' : ':pools=2:frame-threads=2'}:log-level=error`] : ['-x264-params', 'repeat-headers=1:scenecut=0']),
         '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
         '-r', String(fps), '-b:v', String(bitrate), '-maxrate', String(bitrate), '-bufsize', String(bitrate * 2),
     ];

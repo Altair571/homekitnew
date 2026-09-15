@@ -122,6 +122,8 @@ export interface Hksv27Options {
     recordingSource?: (tier: VideoStreamTier, signal: AbortSignal) => AsyncIterable<RecordingSourceItem>;
     isRecordingActive?: () => boolean;
     getWebRTCMedia?: (selection: HksvMediaSelection) => Promise<any>;
+    /** r42: the camera's stream list, so remote viewers can receive a matching camera stream unchanged. */
+    getWebRTCSourceStreams?: () => Promise<any[]>;
     /**
      * Diagnostic bisect: names of services to skip advertising (see camera-mixin's
      * "Disable HKSV-27 Services" setting) to isolate which one a controller objects to.
@@ -183,7 +185,7 @@ export class Hksv27Camera {
         console: Console,
         opts: Hksv27Options,
     ) {
-        console.log('HomeKit HEVC test build: hevc-fixes-2026-09-16-r41');
+        console.log('HomeKit HEVC test build: hevc-fixes-2026-09-16-r42');
         this.accessory = accessory;
         this.console = console;
         this.storage = storage;
@@ -225,6 +227,7 @@ export class Hksv27Camera {
                 supportedVideoTiersValue: this.multiTier.supportedVideoTiersValue,
                 supportedAudioTiersValue: this.multiTier.supportedAudioTiersValue,
                 getMedia: opts.getWebRTCMedia,
+                getSourceStreams: opts.getWebRTCSourceStreams,
                 // r39: the offer shape that plays through Apple's relay in HAP-NodeJS PR 1132.
                 secureVideoOffer: true,
                 // r40: keep the session when the relay reoffers talkback audio.

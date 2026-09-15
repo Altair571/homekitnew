@@ -128,11 +128,18 @@ export function createCameraStorageSettings(device: StorageSettingsDevice) {
             description: 'Highest HEVC tier sent to an iOS 27 WebRTC viewer that connects from outside the LAN (cellular or Apple relay). Those sessions also use this camera\'s Remote Stream in Scrypted, are paced near the tier bitrate, and add Opus loss recovery. LAN viewers are unaffected. Takes effect on the next live view.',
         },
         hksv27WebRTCRemoteResolution: {
-            title: 'Experimental: WebRTC Remote Resolution (r41)',
+            title: 'Experimental: WebRTC Remote Resolution (r42)',
             type: 'string',
-            choices: ['360p (default)', '1080p (experimental)'],
+            choices: ['360p (default)', '1080p (experimental)', '1440p / 2K (experimental)', '2160p / 4K (experimental)'],
             defaultValue: '360p (default)',
-            description: 'Resolution offered to iOS 27 WebRTC viewers. 360p is known to work over cellular. 1080p sends the camera\'s medium tier (1080p at 30 fps, about 1.7 Mbps on 4K cameras); Apple may refuse it for cellular viewers, so try it on remote Wi-Fi first. Takes effect on the next live view.',
+            description: 'Resolution sent to iOS 27 viewers away from home (WebRTC through Apple\'s relay). 360p is known to work over cellular, and 1080p played in r41. 1440p and 4K are untested and Apple may refuse them, especially on cellular. 1080p uses the camera\'s 1080p stream; 1440p scales down the 4K stream, which costs more CPU; 4K sends the camera\'s own 4K stream when it is HEVC. Takes effect on the next live view.',
+        },
+        hksv27WebRTCRemoteBitrate: {
+            title: 'Experimental: WebRTC Remote Video Bitrate (r42)',
+            type: 'string',
+            choices: ['Automatic (default)', 'Camera stream, no re-encode', '2 Mbps', '4 Mbps', '6 Mbps', '8 Mbps', '12 Mbps', '16 Mbps'],
+            defaultValue: 'Automatic (default)',
+            description: 'For remote resolutions above 360p. Automatic re-encodes 1080p at 4 Mbps and 1440p at 6 Mbps, and sends a 4K camera\'s own HEVC stream unchanged. "Camera stream" sends the camera\'s stream unchanged when one has exactly the chosen resolution: no CPU and no re-encoding loss, but the picture waits for the camera\'s next keyframe. A fixed value always re-encodes at that bitrate; above the camera stream\'s own bitrate it cannot add detail. Takes effect on the next live view.',
         },
         hksv27WebRTCPathMode: {
             title: 'Experimental: WebRTC Path Detection',

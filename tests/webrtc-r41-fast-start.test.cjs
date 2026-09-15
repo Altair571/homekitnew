@@ -154,7 +154,8 @@ test('r41 1080p remote resolution is opt-in and offers the medium tier', { timeo
     const cases = [
         [{}, 'max-width=640;max-height=360;max-fps=15;max-br=190000', 190, CameraVideoQuality.LOW],
         [{ hksv27WebRTCRemoteQuality: 'Medium (1080p, recommended)' }, 'max-width=640;max-height=360;max-fps=15;max-br=190000', 190, CameraVideoQuality.LOW],
-        [{ hksv27WebRTCRemoteResolution: '1080p (experimental)' }, 'max-width=1920;max-height=1080;max-fps=30;max-br=1800000', 1800, CameraVideoQuality.MEDIUM],
+        // r42: Automatic re-encodes 1080p at 4 Mbps (r41 offered the tier's 1.7 Mbps).
+        [{ hksv27WebRTCRemoteResolution: '1080p (experimental)' }, 'max-width=1920;max-height=1080;max-fps=30;max-br=4240000', 4240, CameraVideoQuality.MEDIUM],
     ];
     for (const [values, rid, bandwidth, quality] of cases) {
         const management = new camera.WebRTCStreamManagement({ addService() {} }, quiet, {
@@ -194,7 +195,8 @@ test('production settings offer the r41 remote resolution with 360p as the defau
     const block = moduleBlock('./src/camera-mixin.ts');
     const setting = /hksv27WebRTCRemoteResolution: \{([\s\S]*?)\n        \},/.exec(block);
     assert(setting, 'setting present');
-    assert.match(setting[1], /choices: \['360p \(default\)', '1080p \(experimental\)'\]/);
+    // r42 appends 1440p and 4K choices.
+    assert.match(setting[1], /choices: \['360p \(default\)', '1080p \(experimental\)'[,\]]/);
     assert.match(setting[1], /defaultValue: '360p \(default\)'/);
     assert(block.indexOf('hksv27WebRTCRemoteResolution') < block.indexOf('hksv27WebRTCPathMode'));
 });

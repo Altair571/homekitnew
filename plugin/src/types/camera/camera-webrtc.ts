@@ -72,10 +72,107 @@ const REMOTE_OPUS_PACKET_LOSS_PERCENT = 15;
 /** r41: remote viewers join after the first IDR. Force one every 0.5 s for 4 s, then send one every second. */
 const REMOTE_KEYFRAMES = { gopSeconds: 1, startupIntervalSeconds: 0.5, startupSeconds: 4 };
 const REMOTE_RESOLUTION_KEY = 'hksv27WebRTCRemoteResolution';
+const REMOTE_BITRATE_KEY = 'hksv27WebRTCRemoteBitrate';
+/** r42: re-encode bitrate for each opt-in remote resolution while the bitrate setting is Automatic. */
+export const AUTOMATIC_REMOTE_KBPS = { '1080p': 4000, '1440p': 6000, '2160p': 10000 } as const;
+/** r42: a camera stream sent unchanged is variable bitrate, so its offer leaves headroom above the reported rate. */
+const CAMERA_STREAM_PEAK_MULTIPLIER = 1.5;
+const SOURCE_STREAMS_TIMEOUT = 1500;
 
-/** r41: the offer carries one tier. 1080p is opt-in because cellular viewers may refuse it. */
-export function offeredResolution(setting?: string | null): '360p' | '1080p' {
-    return (setting ?? '').trim().startsWith('1080p') ? '1080p' : '360p';
+export type RemoteResolution = '360p' | '1080p' | '1440p' | '2160p';
+export type RemoteBitrate = { mode: 'automatic' } | { mode: 'camera' } | { mode: 'fixed'; kbps: number };
+
+/** r41/r42: the offer carries one tier. Anything above 360p is opt-in because cellular viewers may refuse it. */
+export function offeredResolution(setting?: string | null): RemoteResolution {
+    const value = (setting ?? '').trim();
+    return (['1080p', '1440p', '2160p'] as const).find(resolution => value.startsWith(resolution)) ?? '360p';
+}
+
+export function offeredBitrate(setting?: string | null): RemoteBitrate {
+    const value = (setting ?? '').trim().toLowerCase();
+    if (value.startsWith('camera')) return { mode: 'camera' };
+    const mbps = Number(/^(\d+(?:\.\d+)?) ?mbps\b/.exec(value)?.[1]);
+    return mbps > 0 && mbps <= 50 ? { mode: 'fixed', kbps: Math.round(mbps * 1000) } : { mode: 'automatic' };
+}
+
+/** A camera stream as Scrypted lists it; only the fields the remote plan reads. */
+export interface SourceStreamOption {
+    id?: string;
+    video?: { codec?: string; width?: number; height?: number; fps?: number; bitrate?: number } | null;
+}
+
+/** r42: what a session's offer declares and how its remote video is produced. */
+export interface RemoteVideoPlan {
+    resolution: RemoteResolution;
+    tier: VideoStreamTier;
+    /** Declared in the offer's b=AS, b=TIAS and RID max-br. */
+    peakKbps: number;
+    /** Send the camera's own HEVC stream unchanged instead of re-encoding it. */
+    cameraStream: boolean;
+    label: string;
+}
+
+function lowestTier(tiers: VideoStreamTier[]): VideoStreamTier | undefined {
+    let lowest: VideoStreamTier | undefined;
+    for (const tier of tiers) {
+        if (!lowest || tier.quality > lowest.quality
+            || (tier.quality === lowest.quality && tier.width * tier.height < lowest.width * lowest.height))
+            lowest = tier;
+    }
+    return lowest;
+}
+
+/** r42: the camera tier for a resolution. 1440p on a 4K camera scales its high tier; a smaller camera offers its best tier. */
+export function remoteResolutionTier(tiers: VideoStreamTier[], resolution: RemoteResolution): VideoStreamTier | undefined {
+    const lowest = lowestTier(tiers);
+    if (resolution === '360p' || !lowest) return lowest;
+    if (resolution === '1080p')
+        return tiers.find(tier => Math.min(tier.width, tier.height) === 1080)
+            ?? tiers.find(tier => tier.quality === CameraVideoQuality.MEDIUM) ?? lowest;
+    const target = resolution === '1440p' ? 1440 : 2160;
+    const highest = tiers.reduce((a, b) => b.width * b.height > a.width * a.height ? b : a);
+    const short = Math.min(highest.width, highest.height);
+    if (short <= target) return highest;
+    const even = (value: number) => Math.round(value * target / short / 2) * 2;
+    return { ...highest, width: even(highest.width), height: even(highest.height) };
+}
+
+/** r42: the plan for the resolution and bitrate settings. Without a stream list, a camera-stream plan is
+ * verified against the stream that actually opens when media starts. */
+export function remoteVideoPlan(tiers: VideoStreamTier[], resolution: RemoteResolution, bitrate: RemoteBitrate, streams?: SourceStreamOption[]): RemoteVideoPlan | undefined {
+    const base = remoteResolutionTier(tiers, resolution);
+    if (!base) return undefined;
+    if (resolution === '360p')
+        return { resolution, tier: base, peakKbps: peakBitrateKbps(base.averageBitrateKbps), cameraStream: false, label: '360p (default)' };
+    const size = `${base.width}x${base.height}`;
+    const automatic = AUTOMATIC_REMOTE_KBPS[resolution];
+    const reencode = (kbps: number, why: string): RemoteVideoPlan => ({ resolution, tier: { ...base, averageBitrateKbps: kbps },
+        peakKbps: peakBitrateKbps(kbps), cameraStream: false, label: `${resolution} ${size}, re-encoded at ${kbps} kbps (${why})` });
+    if (bitrate.mode === 'fixed') return reencode(bitrate.kbps, 'bitrate setting');
+    // Automatic sends a 4K camera's own stream: a software 4K re-encode cannot add detail and may not keep 30 fps.
+    if (bitrate.mode === 'automatic' && resolution !== '2160p') return reencode(automatic, 'Automatic');
+    const match = streams?.find(stream => normalizeVideoCodec(stream.video?.codec) === 'h265'
+        && stream.video?.width === base.width && stream.video?.height === base.height);
+    if (streams && !match) return reencode(automatic, `no HEVC camera stream is ${size}`);
+    const reported = Math.round(Number(match?.video?.bitrate) / 1000);
+    const kbps = reported > 0 ? reported : automatic;
+    return { resolution, tier: { ...base, averageBitrateKbps: kbps }, peakKbps: Math.ceil(kbps * CAMERA_STREAM_PEAK_MULTIPLIER), cameraStream: true,
+        label: `${resolution} ${size}, camera stream sent unchanged (${reported > 0 ? `camera reports ${reported} kbps` : 'camera bitrate not reported'}${bitrate.mode === 'automatic' ? ', Automatic' : ''})` };
+}
+
+/** r42: whether the stream that opened can be sent unchanged for a camera-stream plan. Its bitrate is not enforced. */
+export function cameraStreamDecision(input: FFmpegInput, selection: HksvMediaSelection): { copy: boolean; reason: string } {
+    const video = input.mediaStreamOptions?.video;
+    const codec = normalizeVideoCodec(video?.codec);
+    if (codec !== selection.codec)
+        return { copy: false, reason: `camera stream codec ${codec || 'unknown'} is not ${selection.codec}` };
+    if (video?.width !== selection.tier.width || video?.height !== selection.tier.height)
+        return { copy: false, reason: `camera stream ${video?.width || '?'}x${video?.height || '?'} is not ${selection.tier.width}x${selection.tier.height}` };
+    if (typeof video.fps === 'number' && video.fps > selection.tier.frameRate)
+        return { copy: false, reason: `camera stream ${video.fps} fps exceeds ${selection.tier.frameRate} fps` };
+    const kbps = Math.round(Number(video.bitrate) / 1000);
+    return { copy: true, reason: `camera stream setting: ${video.width}x${video.height}${video.fps ? `@${video.fps}` : ''} ${codec.toUpperCase()}`
+        + `${kbps > 0 ? `, camera reports ${kbps} kbps` : ''}, sent without re-encoding` };
 }
 
 export function remoteQualityFloor(setting?: string | null): CameraVideoQuality {
@@ -96,10 +193,10 @@ export function qualityName(quality: CameraVideoQuality): string {
 }
 
 export function remotePacing(tier: VideoStreamTier): { bytesPerSecond: number; burstBytes: number } {
-    return {
-        bytesPerSecond: Math.max(REMOTE_PACING_FLOOR_BPS, tier.averageBitrateKbps * 1000 * REMOTE_PACING_MULTIPLIER) / 8,
-        burstBytes: REMOTE_PACING_BURST_BYTES,
-    };
+    const bytesPerSecond = Math.max(REMOTE_PACING_FLOOR_BPS, tier.averageBitrateKbps * 1000 * REMOTE_PACING_MULTIPLIER) / 8;
+    // r42: timers can fire about every 15 ms (Windows), so each wake-up carries that much credit; otherwise
+    // 4K bitrates queue until the session fails. Tiers up to 1080p at 1.7 Mbps keep the 16 KB burst.
+    return { bytesPerSecond, burstBytes: Math.max(REMOTE_PACING_BURST_BYTES, Math.ceil(bytesPerSecond / 64)) };
 }
 
 export function forcedPathKind(setting?: string | null): 'lan' | 'remote' | undefined {
@@ -314,6 +411,8 @@ export interface WebRTCManagementOptions {
     /** r40: answer the relay reoffer that adds a talkback audio section instead of closing the session.
      * The added receiver is never played; the camera's own video and audio stay send-only. */
     acceptRelayTalkback?: boolean;
+    /** r42: the camera's streams, so a remote viewer can receive a camera stream that already matches the offered tier. */
+    getSourceStreams?: () => Promise<SourceStreamOption[]>;
 }
 
 interface HapWebRTCSession {
@@ -360,6 +459,10 @@ interface HapWebRTCSession {
     answeredAt?: number;
     connectedAt?: number;
     startupLogged?: boolean;
+    /** r42: the remote video plan this session's offer declared. */
+    videoPlan?: RemoteVideoPlan;
+    /** r42: probe counters 5 s after the answer, for the steady-state throughput line. */
+    throughputMark?: { atMs: number; frames: number; bytes: number };
 }
 
 export class WebRTCStreamManagement {
@@ -532,6 +635,8 @@ export class WebRTCStreamManagement {
             return buildWebRTCSolicitOfferResponse({ sessionId, status: WebRTCOfferStatus.ERROR }).toString('base64');
         }
 
+        // r42: decide the remote resolution, bitrate and camera-stream use once; media and reoffers follow this plan.
+        const videoPlan = this.wantsCameraStream() ? await this.cameraStreamVideoPlan() : this.settingsVideoPlan();
         const secureVideoOffer = !!this.opts.secureVideoOffer;
         const pc = new RTCPeerConnection({
             codecs: {
@@ -575,6 +680,7 @@ export class WebRTCStreamManagement {
         const session: HapWebRTCSession = {
             sessionId, pc, vtrack, atrack, videoTransceiver, audioTransceiver, relayRtcp,
             createdAt: Date.now(),
+            videoPlan,
             mediaGeneration: 0,
             videoRid: VIDEO_RID,
             answered: false,
@@ -633,12 +739,13 @@ export class WebRTCStreamManagement {
             if (session.closed || !this.streamingEnabled()) throw new Error('Session canceled during ICE gathering');
             session.wire = observeWebRTCWire(session);
             const sdp = secureVideoOffer
-                ? withSecureVideoOffer(pc.localDescription?.sdp ?? offer.sdp, this.offeredVideoRidLimits(),
-                    peakBitrateKbps(this.offeredVideoTier()?.averageBitrateKbps ?? 180))
-                : withRelaySdpVariant(withSFramePacketization(withExplicitVideoRidPayload(pc.localDescription?.sdp ?? offer.sdp, this.offeredVideoRidLimits()), !!session.sframeConfiguration),
+                ? withSecureVideoOffer(pc.localDescription?.sdp ?? offer.sdp, this.offeredVideoRidLimits(session),
+                    session.videoPlan?.peakKbps ?? peakBitrateKbps(this.offeredVideoTier()?.averageBitrateKbps ?? 180))
+                : withRelaySdpVariant(withSFramePacketization(withExplicitVideoRidPayload(pc.localDescription?.sdp ?? offer.sdp, this.offeredVideoRidLimits(session)), !!session.sframeConfiguration),
                     session.relayVariant, { videoSsrc: videoTransceiver.sender.ssrc, audioSsrc: audioTransceiver.sender.ssrc, videoRid: session.videoRid }, VIDEO_RID);
             this.console.log(`HomeKit WebRTC offer ready: session ${sessionHex.slice(0, 8)}…, H265, send-only, video RID=${session.videoRid}${secureVideoOffer ? ' (secure video offer)' : ''}, outgoing SFrame=${!!session.sframeConfiguration}`);
             this.console.log(`HomeKit WebRTC SSRCs: session ${sessionHex.slice(0, 8)}…, video 0x${(videoTransceiver.sender.ssrc >>> 0).toString(16).padStart(8, '0')}, audio 0x${(audioTransceiver.sender.ssrc >>> 0).toString(16).padStart(8, '0')} (compare with the viewer media blob)`);
+            if (session.videoPlan) this.console.log(`HomeKit WebRTC remote video plan: session ${sessionHex.slice(0, 8)}…, ${session.videoPlan.label}; offer declares ${session.videoPlan.tier.width}x${session.videoPlan.tier.height}@${session.videoPlan.tier.frameRate} up to ${session.videoPlan.peakKbps} kbps`);
             session.contract = observeWebRTCContract(session, sdp);
             this.logDiagnostics(session, 'offer', sdp, candidates);
             return buildWebRTCSolicitOfferResponse({ sessionId, status: WebRTCOfferStatus.SUCCESS,
@@ -701,11 +808,13 @@ export class WebRTCStreamManagement {
             session.diagnosticTimer = setTimeout(() => {
                 if (!session.closed) this.logDiagnostics(session, 'answer-after-5s');
                 if (!session.closed) this.logStartup(session);
+                if (!session.closed) this.markThroughput(session);
             }, 5000);
             session.diagnosticTimer.unref?.();
             session.probeTimers = [15000, 30000, 60000].map(ms => {
                 const timer = setTimeout(() => {
                     if (!session.closed) this.logDiagnostics(session, 'r35-after-' + ms / 1000 + 's');
+                    if (!session.closed && ms === 15000) this.logThroughput(session);
                 }, ms);
                 timer.unref?.(); return timer;
             });
@@ -748,6 +857,36 @@ export class WebRTCStreamManagement {
             this.console.log(`HomeKit WebRTC startup: session ${session.sessionId.toString('hex').slice(0, 8)}…, answer ${at(since(session.answeredAt))}, `
                 + `connected ${at(since(session.connectedAt))}, first video ${at(probe?.video?.firstInputAtMs)}, first keyframe ${at(probe?.video?.firstIrapAtMs)}, `
                 + `relay video ack ${at(probe?.video?.firstReportAtMs)}, first audio ${at(probe?.audio?.firstInputAtMs)}, keyframes sent ${probe?.video?.sourceIrapFrames ?? 0}`);
+        }
+        catch (_) { }
+    }
+
+    /** r42: probe counters 5 s after the answer; the 15 s line measures from here, after the startup keyframe burst. */
+    private markThroughput(session: HapWebRTCSession): void {
+        try {
+            const video: any = session.probe?.snapshot()?.video;
+            if (typeof video?.lastInputAtMs === 'number')
+                session.throughputMark = { atMs: video.lastInputAtMs, frames: video.sourceFrames ?? 0, bytes: video.sourceBytes ?? 0 };
+        }
+        catch (_) { }
+    }
+
+    /** r42: one line to judge remote quality: the frame rate and bitrate actually sent, and the loss the relay reports. */
+    private logThroughput(session: HapWebRTCSession): void {
+        try {
+            const video: any = session.probe?.snapshot()?.video;
+            const mark = session.throughputMark;
+            if (!mark || typeof video?.lastInputAtMs !== 'number') return;
+            const seconds = (video.lastInputAtMs - mark.atMs) / 1000;
+            if (!(seconds >= 1)) return;
+            const fps = (video.sourceFrames - mark.frames) / seconds;
+            const kbps = (video.sourceBytes - mark.bytes) * 8 / seconds / 1000;
+            const plan = session.videoPlan;
+            const slow = plan && !plan.cameraStream && fps < plan.tier.frameRate * 0.9
+                ? `; below ${plan.tier.frameRate} fps, so this server may not re-encode ${plan.resolution} in real time` : '';
+            const loss = session.feedback.fractionLostPercent;
+            this.console.log(`HomeKit WebRTC throughput: session ${session.sessionId.toString('hex').slice(0, 8)}…, ${plan?.label ?? 'default tier'}; `
+                + `video ${fps.toFixed(1)} fps, ${Math.round(kbps)} kbps over ${seconds.toFixed(1)} s, relay loss ${typeof loss === 'number' ? `${loss}%` : 'not reported'}${slow}`);
         }
         catch (_) { }
     }
@@ -803,20 +942,36 @@ export class WebRTCStreamManagement {
      * downlink budget and never received video. Offer and send the lowest tier instead.
      */
     private offeredVideoTier(): VideoStreamTier | undefined {
-        let lowest: VideoStreamTier | undefined;
-        for (const tier of this.opts.videoTiers) {
-            if (!lowest || tier.quality > lowest.quality
-                || (tier.quality === lowest.quality && tier.width * tier.height < lowest.width * lowest.height))
-                lowest = tier;
-        }
-        // r41: an explicit 1080p setting offers the camera's medium tier instead.
-        if (offeredResolution(this.storage?.getItem(REMOTE_RESOLUTION_KEY)) === '1080p')
-            return this.opts.videoTiers.find(tier => tier.quality === CameraVideoQuality.MEDIUM) ?? lowest;
-        return lowest;
+        return this.settingsVideoPlan()?.tier;
     }
 
-    private offeredVideoRidLimits(): VideoRidLimits {
-        const offered = this.offeredVideoTier();
+    /** r42: the remote video plan for the current settings. */
+    private settingsVideoPlan(streams?: SourceStreamOption[]): RemoteVideoPlan | undefined {
+        return remoteVideoPlan(this.opts.videoTiers, offeredResolution(this.storage?.getItem(REMOTE_RESOLUTION_KEY)),
+            offeredBitrate(this.storage?.getItem(REMOTE_BITRATE_KEY)), streams);
+    }
+
+    /** r42: only a camera-stream plan reads the stream list, so the default offer stays synchronous until ICE gathering. */
+    private wantsCameraStream(): boolean {
+        const resolution = offeredResolution(this.storage?.getItem(REMOTE_RESOLUTION_KEY));
+        const bitrate = offeredBitrate(this.storage?.getItem(REMOTE_BITRATE_KEY));
+        return !!this.opts.getSourceStreams && resolution !== '360p'
+            && (bitrate.mode === 'camera' || (bitrate.mode === 'automatic' && resolution === '2160p'));
+    }
+
+    private async cameraStreamVideoPlan(): Promise<RemoteVideoPlan | undefined> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const streams = await Promise.race([
+            Promise.resolve().then(() => this.opts.getSourceStreams!()).then(list => Array.isArray(list) ? list : undefined, () => undefined),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), SOURCE_STREAMS_TIMEOUT); }),
+        ]);
+        clearTimeout(timer);
+        if (!streams) this.console.warn('HomeKit WebRTC: camera stream list unavailable; the camera stream is checked when media starts');
+        return this.settingsVideoPlan(streams);
+    }
+
+    private offeredVideoRidLimits(session?: HapWebRTCSession): VideoRidLimits {
+        const offered = session?.videoPlan?.tier ?? this.offeredVideoTier();
         const tiers = offered ? [offered] : this.opts.videoTiers;
         return {
             width: Math.max(...tiers.map(t => t.width)),
@@ -840,19 +995,26 @@ export class WebRTCStreamManagement {
         const hevcMaxPicture = hevcLevel <= 30 ? 36864 : hevcLevel <= 60 ? 122880 : hevcLevel <= 63 ? 245760
             : hevcLevel <= 90 ? 552960 : hevcLevel <= 93 ? 983040 : hevcLevel <= 123 ? 2228224 : 8912896;
         const rid = session.videoRidLimits;
-        const tiers = this.opts.videoTiers.filter(t => t.frameRate <= maxFr
+        const fits = (t: VideoStreamTier) => t.frameRate <= maxFr
             && t.width <= (rid?.width ?? Infinity)
             && t.height <= (rid?.height ?? Infinity)
             && t.frameRate <= (rid?.frameRate ?? Infinity)
             && Math.ceil(t.width / 16) * Math.ceil(t.height / 16) <= maxFs
             && (codec !== 'h264' || Math.ceil(t.width / 16) * Math.ceil(t.height / 16) <= h264MaxFs)
-            && (codec !== 'h265' || t.width * t.height <= hevcMaxPicture));
+            && (codec !== 'h265' || t.width * t.height <= hevcMaxPicture);
+        const tiers = this.opts.videoTiers.filter(fits);
         if (!tiers.length) throw new Error('No advertised tier fits the negotiated codec limits');
         // r32: send exactly the tier the offer declared while the answer and codec allow it.
-        const offered = this.offeredVideoTier();
-        const tier = offered && tiers.includes(offered) ? offered
+        // r42: the declared tier can be a scaled 1440p tier or carry its own bitrate, so check it rather than list membership.
+        const offered = session.videoPlan?.tier ?? this.offeredVideoTier();
+        const tier = offered && fits(offered) ? offered
             : session.remote ? selectRemoteTier(tiers, remoteQualityFloor(this.storage?.getItem(REMOTE_QUALITY_KEY))) ?? tiers[0] : tiers[0];
         return { codec, tier, remote: !!session.remote };
+    }
+
+    /** r42: a remote session whose plan asks for the camera's own stream at the tier it sends. */
+    private sendsCameraStream(session: HapWebRTCSession, selection: HksvMediaSelection): boolean {
+        return !!(selection.remote && session.videoPlan?.cameraStream && session.videoPlan.tier === selection.tier);
     }
 
     /** Classify the nominated ICE pair once the transport is connected; a setting may force it. */
@@ -876,7 +1038,10 @@ export class WebRTCStreamManagement {
             const path = session.path!;
             this.console.log(`HomeKit WebRTC path: ${path.kind}${path.forced ? ' (forced by setting)' : ''}; reason ${path.reason}, local ${path.local}, remote ${path.remote}, IPv${path.family}; `
                 + (selection.remote
-                    ? `remote profile: ${qualityName(selection.tier.quality)} tier ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate} ${selection.tier.averageBitrateKbps} kbps, remote stream, paced ${Math.round(remotePacing(selection.tier).bytesPerSecond * 8 / 1000)} kbps, ${REMOTE_SLICE_BYTES}-byte slices, Opus FEC, keyframes every ${REMOTE_KEYFRAMES.startupIntervalSeconds} s for ${REMOTE_KEYFRAMES.startupSeconds} s then every ${REMOTE_KEYFRAMES.gopSeconds} s`
+                    ? `remote profile: ${qualityName(selection.tier.quality)} tier ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate} ${selection.tier.averageBitrateKbps} kbps, remote stream, paced ${Math.round(remotePacing(selection.tier).bytesPerSecond * 8 / 1000)} kbps, ${REMOTE_SLICE_BYTES}-byte slices, Opus FEC, `
+                        + (this.sendsCameraStream(session, selection) ? 'camera stream requested, keyframes from the camera'
+                            : `keyframes every ${REMOTE_KEYFRAMES.startupIntervalSeconds} s for ${REMOTE_KEYFRAMES.startupSeconds} s then every ${REMOTE_KEYFRAMES.gopSeconds} s`)
+                        + (session.videoPlan ? `; plan ${session.videoPlan.label}` : '')
                     : 'LAN profile unchanged from r25'));
             const input = await this.getMedia(selection);
             if (session.closed || generation !== session.mediaGeneration || !this.streamingEnabled()) return;
@@ -919,8 +1084,12 @@ export class WebRTCStreamManagement {
             }, error => { this.console.error(error.message); this.closeSession(session.sessionId.toString('hex')); },
             selection.remote ? remotePacing(selection.tier) : undefined);
             const nativeDecision = videoCopyDecision(input, selection.codec, selection.tier, { allowLowerFrameRate: selection.remote });
-            // r41: remote viewers need a bounded bitrate and frequent keyframes, so the camera stream is never passed through.
-            const decision = selection.remote && nativeDecision.copy
+            // r41: remote viewers need a bounded bitrate and frequent keyframes, so the camera stream is not passed through,
+            // r42: unless the session's plan asks for the camera stream and the stream that opened matches the offered tier.
+            const cameraStream = this.sendsCameraStream(session, selection) ? cameraStreamDecision(input, selection) : undefined;
+            const decision = cameraStream?.copy ? cameraStream
+                : cameraStream ? { copy: false, reason: `${cameraStream.reason}; re-encoding instead` }
+                : selection.remote && nativeDecision.copy
                 ? { copy: false, reason: `remote viewers get a controlled bitrate and keyframe schedule (source matched: ${nativeDecision.reason})` }
                 : nativeDecision;
             this.console.log(`HomeKit WebRTC output: ${selection.codec} ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate}, ${decision.copy ? 'copy' : 'encode'}, Opus/48000`);
@@ -931,7 +1100,9 @@ export class WebRTCStreamManagement {
                     encoderArguments: ['-map', '0:v:0', ...(decision.copy
                         ? ['-c:v', 'copy', '-bsf:v', 'dump_extra']
                         : videoEncoderArguments(selection.codec, selection.tier.width, selection.tier.height,
-                            selection.tier.frameRate, selection.tier.averageBitrateKbps, selection.remote ? REMOTE_KEYFRAMES : undefined))],
+                            selection.tier.frameRate, selection.tier.averageBitrateKbps, selection.remote ? REMOTE_KEYFRAMES : undefined,
+                            // r42: two x265 threads cannot hold 1440p or 4K at 30 fps; 1080p and below keep the earlier arguments.
+                            selection.tier.width * selection.tier.height > 1920 * 1080 ? { threads: 'auto' } : undefined))],
                     onRtp: (rtp, codec) => {
                         if (!active() || normalizeVideoCodec(codec) !== selection.codec) return;
                         try {
@@ -1083,7 +1254,7 @@ export class WebRTCStreamManagement {
             this.assertReceiveInactive(session);
             const selection = this.mediaSelection(session);
             session.answered = true;
-            const answerLimits = { ...this.offeredVideoRidLimits(), ...session.videoRidLimits };
+            const answerLimits = { ...this.offeredVideoRidLimits(session), ...session.videoRidLimits };
             const localAnswer = (session.pc.localDescription as any)?.sdp ?? (answer as any).sdp;
             // r39: like camera.ui, answer a relay reoffer with werift's description unchanged.
             const sdpAnswer = this.opts.secureVideoOffer ? localAnswer
