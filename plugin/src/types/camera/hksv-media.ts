@@ -46,14 +46,24 @@ export function canCopyVideo(input: FFmpegInput, codec: CameraVideoCodec, tier?:
     return videoCopyDecision(input, codec, tier).copy;
 }
 
-export function videoEncoderArguments(codec: CameraVideoCodec, width: number, height: number, fps: number, bitrateKbps: number): string[] {
+/** r41: keyframe schedule for viewers that join after the stream has started. */
+export interface KeyframeSchedule {
+    /** Regular keyframe interval in seconds. */
+    gopSeconds: number;
+    /** Force an IDR this often during the first startupSeconds. */
+    startupIntervalSeconds: number;
+    startupSeconds: number;
+}
+
+export function videoEncoderArguments(codec: CameraVideoCodec, width: number, height: number, fps: number, bitrateKbps: number, keyframes?: KeyframeSchedule): string[] {
     const bitrate = Math.max(64, Math.round(bitrateKbps)) * 1000;
-    const gop = Math.max(1, Math.round(fps * 2));
+    const gop = Math.max(1, Math.round(fps * (keyframes?.gopSeconds ?? 2)));
     return [
         '-c:v', codec === 'h265' ? 'libx265' : 'libx264',
         '-preset', 'ultrafast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p',
         '-profile:v', codec === 'h265' ? 'main' : 'baseline',
         '-bf', '0', '-g', String(gop), '-keyint_min', String(gop),
+        ...(keyframes ? ['-forced-idr', '1', '-force_key_frames', `expr:lte(t,${keyframes.startupSeconds})*gte(t,n_forced*${keyframes.startupIntervalSeconds})`] : []),
         ...(codec === 'h264' ? ['-sc_threshold', '0'] : []),
         ...(codec === 'h265' ? ['-x265-params', `repeat-headers=1:aud=1:bframes=0:open-gop=0:scenecut=0:keyint=${gop}:min-keyint=${gop}:pools=2:frame-threads=2:log-level=error`] : ['-x264-params', 'repeat-headers=1:scenecut=0']),
         '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,

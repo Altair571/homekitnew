@@ -302,6 +302,8 @@ export async function startRtpForwarderProcess(console: Console, ffmpegInput: FF
                                         allowAudioTranscoderExit = true;
                                         const ffmpegArgs = [
                                             '-hide_banner',
+                                            // r41: the ADTS frames are already parsed; default probing delayed audio by about 3 s.
+                                            '-analyzeduration', '0', '-probesize', '512',
                                             '-f', 'aac',
                                             '-i', 'pipe:3',
                                             ...audio.encoderArguments,

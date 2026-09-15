@@ -69,6 +69,14 @@ const REMOTE_PACING_MULTIPLIER = 4;
 const REMOTE_PACING_FLOOR_BPS = 2_000_000;
 const REMOTE_PACING_BURST_BYTES = 16384;
 const REMOTE_OPUS_PACKET_LOSS_PERCENT = 15;
+/** r41: remote viewers join after the first IDR. Force one every 0.5 s for 4 s, then send one every second. */
+const REMOTE_KEYFRAMES = { gopSeconds: 1, startupIntervalSeconds: 0.5, startupSeconds: 4 };
+const REMOTE_RESOLUTION_KEY = 'hksv27WebRTCRemoteResolution';
+
+/** r41: the offer carries one tier. 1080p is opt-in because cellular viewers may refuse it. */
+export function offeredResolution(setting?: string | null): '360p' | '1080p' {
+    return (setting ?? '').trim().startsWith('1080p') ? '1080p' : '360p';
+}
 
 export function remoteQualityFloor(setting?: string | null): CameraVideoQuality {
     switch ((setting ?? '').trim().toLowerCase().split(/[\s(]/)[0]) {
@@ -348,6 +356,10 @@ interface HapWebRTCSession {
     createdAt: number;
     /** r40: the negotiation the running media was started for. */
     mediaSignature?: string;
+    /** r41: startup milestones for the timing summary. */
+    answeredAt?: number;
+    connectedAt?: number;
+    startupLogged?: boolean;
 }
 
 export class WebRTCStreamManagement {
@@ -599,8 +611,10 @@ export class WebRTCStreamManagement {
         });
         pc.connectionStateChange.subscribe((state: string) => {
             this.console.log(`HomeKit iOS 27: WebRTC session ${sessionHex.slice(0, 8)}… connection state: ${state}`);
-            if (state === 'connected')
+            if (state === 'connected') {
+                session.connectedAt ??= Date.now();
                 this.startMedia(session).catch(e => { this.console.error('WebRTC media start failed', e); this.closeSession(sessionHex); });
+            }
             else if (state === 'failed' || state === 'closed' || state === 'disconnected')
                 this.closeSession(sessionHex);
         });
@@ -668,6 +682,7 @@ export class WebRTCStreamManagement {
             this.assertReceiveInactive(session);
             this.mediaSelection(session);
             session.answered = true;
+            session.answeredAt ??= Date.now();
             // Keep the setup timeout until a connection actually carries media.
             for (const candidate of parsed.additionalCandidates) {
                 try {
@@ -685,6 +700,7 @@ export class WebRTCStreamManagement {
             this.logDiagnostics(session, 'answer-applied');
             session.diagnosticTimer = setTimeout(() => {
                 if (!session.closed) this.logDiagnostics(session, 'answer-after-5s');
+                if (!session.closed) this.logStartup(session);
             }, 5000);
             session.diagnosticTimer.unref?.();
             session.probeTimers = [15000, 30000, 60000].map(ms => {
@@ -717,6 +733,21 @@ export class WebRTCStreamManagement {
                 : { sdp: summarizeWebRTCSdp(sdp), additionalCandidates: summarizeWebRTCCandidates(candidates ?? []), contractSdp: summarizeWebRTCContractSdp(sdp) };
             this.console.log(`HomeKit WebRTC diagnostic: session ${session.sessionId.toString('hex').slice(0, 8)}… `
                 + `stage=${stage} elapsedMs=${Date.now() - session.createdAt} ${JSON.stringify(details)}`);
+        }
+        catch (_) { }
+    }
+
+    /** r41: one line to compare startup latency between builds and networks. */
+    private logStartup(session: HapWebRTCSession): void {
+        try {
+            if (session.startupLogged) return;
+            session.startupLogged = true;
+            const probe: any = session.probe?.snapshot();
+            const since = (time?: number) => time === undefined ? undefined : time - session.createdAt;
+            const at = (ms?: number) => typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)} ms` : 'not yet';
+            this.console.log(`HomeKit WebRTC startup: session ${session.sessionId.toString('hex').slice(0, 8)}…, answer ${at(since(session.answeredAt))}, `
+                + `connected ${at(since(session.connectedAt))}, first video ${at(probe?.video?.firstInputAtMs)}, first keyframe ${at(probe?.video?.firstIrapAtMs)}, `
+                + `relay video ack ${at(probe?.video?.firstReportAtMs)}, first audio ${at(probe?.audio?.firstInputAtMs)}, keyframes sent ${probe?.video?.sourceIrapFrames ?? 0}`);
         }
         catch (_) { }
     }
@@ -778,6 +809,9 @@ export class WebRTCStreamManagement {
                 || (tier.quality === lowest.quality && tier.width * tier.height < lowest.width * lowest.height))
                 lowest = tier;
         }
+        // r41: an explicit 1080p setting offers the camera's medium tier instead.
+        if (offeredResolution(this.storage?.getItem(REMOTE_RESOLUTION_KEY)) === '1080p')
+            return this.opts.videoTiers.find(tier => tier.quality === CameraVideoQuality.MEDIUM) ?? lowest;
         return lowest;
     }
 
@@ -842,7 +876,7 @@ export class WebRTCStreamManagement {
             const path = session.path!;
             this.console.log(`HomeKit WebRTC path: ${path.kind}${path.forced ? ' (forced by setting)' : ''}; reason ${path.reason}, local ${path.local}, remote ${path.remote}, IPv${path.family}; `
                 + (selection.remote
-                    ? `remote profile: ${qualityName(selection.tier.quality)} tier ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate} ${selection.tier.averageBitrateKbps} kbps, remote stream, paced ${Math.round(remotePacing(selection.tier).bytesPerSecond * 8 / 1000)} kbps, ${REMOTE_SLICE_BYTES}-byte slices, Opus FEC`
+                    ? `remote profile: ${qualityName(selection.tier.quality)} tier ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate} ${selection.tier.averageBitrateKbps} kbps, remote stream, paced ${Math.round(remotePacing(selection.tier).bytesPerSecond * 8 / 1000)} kbps, ${REMOTE_SLICE_BYTES}-byte slices, Opus FEC, keyframes every ${REMOTE_KEYFRAMES.startupIntervalSeconds} s for ${REMOTE_KEYFRAMES.startupSeconds} s then every ${REMOTE_KEYFRAMES.gopSeconds} s`
                     : 'LAN profile unchanged from r25'));
             const input = await this.getMedia(selection);
             if (session.closed || generation !== session.mediaGeneration || !this.streamingEnabled()) return;
@@ -884,7 +918,11 @@ export class WebRTCStreamManagement {
                 }
             }, error => { this.console.error(error.message); this.closeSession(session.sessionId.toString('hex')); },
             selection.remote ? remotePacing(selection.tier) : undefined);
-            const decision = videoCopyDecision(input, selection.codec, selection.tier, { allowLowerFrameRate: selection.remote });
+            const nativeDecision = videoCopyDecision(input, selection.codec, selection.tier, { allowLowerFrameRate: selection.remote });
+            // r41: remote viewers need a bounded bitrate and frequent keyframes, so the camera stream is never passed through.
+            const decision = selection.remote && nativeDecision.copy
+                ? { copy: false, reason: `remote viewers get a controlled bitrate and keyframe schedule (source matched: ${nativeDecision.reason})` }
+                : nativeDecision;
             this.console.log(`HomeKit WebRTC output: ${selection.codec} ${selection.tier.width}x${selection.tier.height}@${selection.tier.frameRate}, ${decision.copy ? 'copy' : 'encode'}, Opus/48000`);
             this.console.log(`HomeKit WebRTC video ${decision.copy ? 'passthrough' : 're-encode'} reason: ${decision.reason}`);
             const forwarder = await startRtpForwarderProcess(this.console, videoInput, {
@@ -893,7 +931,7 @@ export class WebRTCStreamManagement {
                     encoderArguments: ['-map', '0:v:0', ...(decision.copy
                         ? ['-c:v', 'copy', '-bsf:v', 'dump_extra']
                         : videoEncoderArguments(selection.codec, selection.tier.width, selection.tier.height,
-                            selection.tier.frameRate, selection.tier.averageBitrateKbps))],
+                            selection.tier.frameRate, selection.tier.averageBitrateKbps, selection.remote ? REMOTE_KEYFRAMES : undefined))],
                     onRtp: (rtp, codec) => {
                         if (!active() || normalizeVideoCodec(codec) !== selection.codec) return;
                         try {

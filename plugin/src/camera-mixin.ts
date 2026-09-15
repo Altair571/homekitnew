@@ -127,6 +127,13 @@ export function createCameraStorageSettings(device: StorageSettingsDevice) {
             defaultValue: 'Medium (1080p, recommended)',
             description: 'Highest HEVC tier sent to an iOS 27 WebRTC viewer that connects from outside the LAN (cellular or Apple relay). Those sessions also use this camera\'s Remote Stream in Scrypted, are paced near the tier bitrate, and add Opus loss recovery. LAN viewers are unaffected. Takes effect on the next live view.',
         },
+        hksv27WebRTCRemoteResolution: {
+            title: 'Experimental: WebRTC Remote Resolution (r41)',
+            type: 'string',
+            choices: ['360p (default)', '1080p (experimental)'],
+            defaultValue: '360p (default)',
+            description: 'Resolution offered to iOS 27 WebRTC viewers. 360p is known to work over cellular. 1080p sends the camera\'s medium tier (1080p at 30 fps, about 1.7 Mbps on 4K cameras); Apple may refuse it for cellular viewers, so try it on remote Wi-Fi first. Takes effect on the next live view.',
+        },
         hksv27WebRTCPathMode: {
             title: 'Experimental: WebRTC Path Detection',
             type: 'string',

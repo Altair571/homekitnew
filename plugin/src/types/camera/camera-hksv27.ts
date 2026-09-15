@@ -183,7 +183,7 @@ export class Hksv27Camera {
         console: Console,
         opts: Hksv27Options,
     ) {
-        console.log('HomeKit HEVC test build: hevc-fixes-2026-09-16-r40');
+        console.log('HomeKit HEVC test build: hevc-fixes-2026-09-16-r41');
         this.accessory = accessory;
         this.console = console;
         this.storage = storage;
