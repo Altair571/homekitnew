@@ -32,7 +32,17 @@ Live view — at home and away, RTP and WebRTC, SFrame, every r43 send-path chan
 
 ## Install
 
-r44 is not a published release. Build it from this repository:
+Put `plugin-hevc-webrtc-r44.zip` and `Install-Scrypted-Plugin-r44.command` in the same folder,
+then:
+
+```bash
+python3 Install-Scrypted-Plugin-r44.command --server https://your-scrypted-host:10443
+```
+
+The installer checks the ZIP's SHA-256 against the tested build, asks for your Scrypted username
+and password (never saved), and uploads the ZIP to the existing HomeKit plugin. To build the same
+artifacts yourself instead — the build is deterministic, and the bundle is always
+`65e910ad8a71cfe27a98c3feb7564c9ac7d6fddd601c1232ae2b2fc6470a9700`:
 
 ```bash
 npm ci
@@ -40,11 +50,6 @@ curl -LO https://github.com/Altair571/homekitnew/releases/download/r43/plugin-he
 python3 build-r44-from-r43.py --verify-base
 HK_TEST_BUNDLE=dist-r44/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs
 ```
-
-The build is deterministic: the bundle is always
-`65e910ad8a71cfe27a98c3feb7564c9ac7d6fddd601c1232ae2b2fc6470a9700`. Upload `dist-r44/` with the
-r43 installer, or run `python3 build-r44-from-r43.py --package` once the tests pass on your host
-to produce `plugin-hevc-webrtc-r44.zip`.
 
 ## Test
 
@@ -84,13 +89,12 @@ What those lines answer, in order:
 
 ## Validation
 
-Against the r44 bundle in a Linux container, 259 of 261 checks pass. The two failures are the
-live FFmpeg/WebRTC fixtures (`real WebRTC ICE/DTLS/SRTP carries identical HEVC pictures`), which
-compare an x265 encode against a recorded hash; they fail identically on the unmodified r43
-bundle in the same container and are unrelated to this release. Package generation still requires
-a clean run, so run `--package` on a host where those two pass.
+All 261 automated checks pass on this exact bundle, and packaging is locked to that run. (The two
+live FFmpeg/WebRTC fixtures need a UDP receive buffer big enough for their 100-frame burst; on
+Linux `sysctl -w net.core.rmem_default=4194304` is what the README prescribes, and without it
+they fail on any build.)
 
-Among the passing checks, five are new and cover the upload end to end against a publishing point
+Five of those checks are new and cover the upload end to end against a publishing point
 that requires the client certificate the plugin was issued: the full provisioning sequence
 through the real HAP characteristics, an encrypted clip that decrypts back to the recorder's
 exact bytes, an unencrypted clip that is byte-for-byte what the recorder produced, the 412

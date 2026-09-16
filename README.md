@@ -33,20 +33,20 @@ specified and what is not, and [R44-TESTING.md](R44-TESTING.md) for how to test 
 
 ## Install
 
-1. From [Releases](https://github.com/Altair571/homekitnew/releases), download `plugin-hevc-webrtc-rNN.zip` and `Install-Scrypted-Plugin-rNN.command` from the same release into one folder. [r42](https://github.com/Altair571/homekitnew/releases/tag/r42) is known working and [r43](https://github.com/Altair571/homekitnew/releases/tag/r43) is the pre-release; earlier releases stay available for rollback. r44 is not packaged as a release yet — build it from this repository as described below.
+1. From [Releases](https://github.com/Altair571/homekitnew/releases), download `plugin-hevc-webrtc-rNN.zip` and `Install-Scrypted-Plugin-rNN.command` from the same release into one folder. [r42](https://github.com/Altair571/homekitnew/releases/tag/r42) is known working, and r43 and r44 are pre-releases; earlier releases stay available for rollback.
 2. Run the installer with your Scrypted server address:
 
    ```bash
-   python3 Install-Scrypted-Plugin-r43.command --server https://your-scrypted-host:10443
+   python3 Install-Scrypted-Plugin-r44.command --server https://your-scrypted-host:10443
    ```
 
    It checks the ZIP's SHA-256, asks for your Scrypted username and password (never saved), and uploads the ZIP to the existing HomeKit plugin.
-3. Confirm the HomeKit plugin console shows the build, for example `hevc-fixes-2026-09-16-r43`.
+3. Confirm the HomeKit plugin console shows the build, for example `hevc-fixes-2026-09-16-r44`.
 4. In the camera's HomeKit settings, enable **Experimental: HEVC / 4K Streaming and HKSV (iOS/tvOS 27+)**.
 5. Optional: choose the remote quality with **Experimental: WebRTC Remote Resolution (r42)** and **Experimental: WebRTC Remote Video Bitrate (r42)**. 360p is the default.
 6. On r44, optionally turn on **Experimental: HKSV CMAF Direct Upload (r44)** to let the plugin upload HomeKit Secure Video clips to Apple itself. It is off by default; see [R44-TESTING.md](R44-TESTING.md).
 
-Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md`, `R41-TESTING.md`, `R42-TESTING.md`, `R43-TESTING.md`) describes what to check after installing.
+Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md` … `R44-TESTING.md`) describes what to check after installing.
 
 ## How remote HEVC works
 
@@ -90,7 +90,7 @@ Replaying 10 s of HEVC through the real send path, that is 12.3% of one core dow
 | `tests/` | Node test suite that runs against a built bundle, plus the installer tests |
 | `build-r39-from-r38.py` … `build-r44-from-r43.py` | Incremental release builders. Each patches the previous checksum-locked release ZIP. |
 | `build-r35-from-r34.py` | Shared helpers the builders import |
-| `Install Scrypted Plugin.command` | The installer for the latest packaged release (r43) |
+| `Install Scrypted Plugin.command` | The installer for the latest packaged release (r44) |
 | `R39-TESTING.md` … `R44-TESTING.md` | Release notes and test steps |
 | `CMAF-UPLOAD.md` | What Apple's HKSV guide specifies about direct upload, and what it leaves undefined |
 
@@ -108,10 +108,12 @@ python3 build-r43-from-r42.py                     # writes dist-r43/
 curl -LO https://github.com/Altair571/homekitnew/releases/download/r43/plugin-hevc-webrtc-r43.zip
 python3 build-r44-from-r43.py --verify-base       # writes dist-r44/
 HK_TEST_BUNDLE=dist-r44/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs
-python3 tests/test_installer.py                   # checks the packaged r43 ZIP
+python3 tests/test_installer.py                   # checks the packaged r44 ZIP
 ```
 
-`tests/r43-send-path.test.cjs` covers what r43 changed, including a digest of the
+`tests/cmaf-upload.test.cjs` covers what r44 changed, driving the whole provisioning
+sequence into a publishing point that requires the client certificate the plugin was
+issued. `tests/r43-send-path.test.cjs` covers what r43 changed, including a digest of the
 bytes the SFrame sender puts on the wire, which r42 produces too. Two tests,
 `real WebRTC ICE/DTLS/SRTP carries identical HEVC pictures`, drive a loopback WebRTC
 session through real ffmpeg. They send a 100-frame burst, so a host with a small
@@ -120,33 +122,33 @@ test; on Linux, `sysctl -w net.core.rmem_default=4194304` is enough. Limiting
 concurrency keeps the probe's decoder fixture inside its timeout on a small machine.
 
 Packaging is locked to a passing run: `--package` rebuilds the ZIP only if
-`diagnostics/r43-tests.json` records this exact bundle, a zero exit code, and the
-hash of `diagnostics/r43-tests.log`, and only if that log shows no failed or skipped
+`diagnostics/r44-tests.json` records this exact bundle, a zero exit code, and the
+hash of `diagnostics/r44-tests.log`, and only if that log shows no failed or skipped
 test. Record the run, then package:
 
 ```bash
 mkdir -p diagnostics
-HK_TEST_BUNDLE=dist-r43/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs > diagnostics/r43-tests.log; code=$?
+HK_TEST_BUNDLE=dist-r44/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs > diagnostics/r44-tests.log; code=$?
 python3 - "$code" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-out = {'bundleSha256': hashlib.sha256(Path('dist-r43/main.nodejs.js').read_bytes()).hexdigest(),
+out = {'bundleSha256': hashlib.sha256(Path('dist-r44/main.nodejs.js').read_bytes()).hexdigest(),
        'returnCode': int(sys.argv[1]),
-       'logSha256': hashlib.sha256(Path('diagnostics/r43-tests.log').read_bytes()).hexdigest()}
-Path('diagnostics/r43-tests.json').write_text(json.dumps(out, indent=2) + '\n')
+       'logSha256': hashlib.sha256(Path('diagnostics/r44-tests.log').read_bytes()).hexdigest()}
+Path('diagnostics/r44-tests.json').write_text(json.dumps(out, indent=2) + '\n')
 PY
-python3 build-r43-from-r42.py --package
+python3 build-r44-from-r43.py --package
 ```
 
 The release's other two assets are copies of what the packaging step pinned, so they
 are generated rather than committed:
 
 ```bash
-cp "Install Scrypted Plugin.command" Install-Scrypted-Plugin-r43.command
-sha256sum plugin-hevc-webrtc-r43.zip Install-Scrypted-Plugin-r43.command > SHA256SUMS-r43.txt
+cp "Install Scrypted Plugin.command" Install-Scrypted-Plugin-r44.command
+sha256sum plugin-hevc-webrtc-r44.zip Install-Scrypted-Plugin-r44.command > SHA256SUMS-r44.txt
 ```
 
-Upload those two and the ZIP to the release, with `r43-release-notes.md` as its
+Upload those two and the ZIP to the release, with `r44-release-notes.md` as its
 description.
 
 To run the suite against an earlier release instead, unzip its bundle into `dist/`
