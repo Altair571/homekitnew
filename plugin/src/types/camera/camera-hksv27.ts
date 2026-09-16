@@ -87,6 +87,7 @@ import { buildClientCSR, createClientIdentity, loadClientIdentity, signNonce } f
 import { HksvRecordingBuffer, RecordingWindow } from './hksv-recording-buffer';
 import { RecordingSourceItem } from './camera-cmaf-source';
 import { CmafIngestSession } from './cmaf-ingest';
+import { CmafCencProtection } from './hksv-cmaf-protection';
 import { deriveSensorUuid, logCharacteristicReads, MinimalStorage, MultiTierStreamManagement, recordBisectSignal, setBisectReadTallyStorage, StreamingGate } from './camera-multitier';
 import { WebRTCStreamManagement } from './camera-webrtc';
 import { buildSensorVideoTiers, SensorClass, VideoStreamTier } from './hksv-stream-tiers';
@@ -105,11 +106,30 @@ const KEYS = {
     clientCa: 'hksv27-client-ca',
     cameraKey: 'hksv27-camera-key',
     cameraKeyNumber: 'hksv27-camera-key-number',
+    cameraKeyIv: 'hksv27-camera-key-iv',
     clipCounter: 'hksv27-clip-counter',
 } as const;
 
 /** Milliseconds before notAfter at which the client certificate is reported as needing update. */
 const CERTIFICATE_RENEWAL_WINDOW = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * What §4.9 uploads do with the media.
+ *   'off'   — refuse to upload. The safe default while the protection contract is unconfirmed.
+ *   'cenc'  — encrypt with the §4.7 Camera Key before it leaves this host (hksv-cmaf-protection).
+ *   'clear' — upload the recording unencrypted, protected only by the mutually-authenticated TLS
+ *             connection to Apple's publishing point. Diagnostic: it isolates the transport from
+ *             the protection, at the cost of the clip being readable at the far end.
+ */
+export type CmafUploadMode = 'off' | 'cenc' | 'clear';
+
+/**
+ * Per-sample IVs reserved when a clip starts. AES-CTR is broken by reusing an IV under one key,
+ * and a host that loses power mid-clip would otherwise resume at a counter it had already spent,
+ * so the reservation is written before any sample is encrypted and never handed back. At 2^64
+ * IVs per key, spending a million per clip is free.
+ */
+const IV_RESERVATION = 1000000n;
 
 export interface Hksv27Options {
     takeSnapshot?: (request: SnapshotRequest) => Promise<Buffer>;
@@ -131,6 +151,8 @@ export interface Hksv27Options {
     disabledServices?: Set<string>;
     /** §4.5 data Version field — the guide does not enumerate values; default 1. */
     capabilitiesDataVersion?: number;
+    /** What a §4.9 upload does with the media. Defaults to 'off'. */
+    cmafUploadMode?: CmafUploadMode;
 }
 
 interface ActiveUpload {
@@ -337,11 +359,18 @@ export class Hksv27Camera {
         this.recordingBuffer.reset();
     }
 
+    private get uploadMode(): CmafUploadMode {
+        return this.opts.cmafUploadMode ?? 'off';
+    }
+
     private recordingUnavailableReason(): string | undefined {
         if (!this.opts.recordingSource || this.off.has('Buffer Management')) return 'recording source disabled';
         if (!this.globalActive()) return 'camera or streaming disabled';
-        if (this.storage.getItem(KEYS.cameraKey)) return 'Camera Key media protection is not implemented; Apple HKSV upload is unavailable';
+        if (this.uploadMode === 'off')
+            return 'CMAF direct upload is off — set "Experimental: HKSV CMAF Direct Upload" to record';
         if (!this.opts.isRecordingActive?.()) return 'Recording Active is off';
+        if (this.uploadMode === 'cenc' && !this.storage.getItem(KEYS.cameraKey))
+            return 'waiting for the Camera Key the controller encrypts recordings with';
         if (!this.publishingPoint?.url || !this.storage.getItem(KEYS.clientCertificate) || !this.storage.getItem(KEYS.clientKeyPem))
             return 'waiting for recording publishing point and client identity';
     }
@@ -349,8 +378,13 @@ export class Hksv27Camera {
     private updateRecorder(): void {
         const reason = this.recordingUnavailableReason();
         if (reason !== this.recorderIdleReason) {
+            const wasIdle = this.recorderIdleReason !== undefined;
             this.recorderIdleReason = reason;
             if (reason) this.console.log(`HomeKit HEVC recording buffer idle: ${reason}`);
+            // The transition to ready is the one a provisioning log needs: it names the moment
+            // every §3.5/§3.9/§3.10 prerequisite an upload needs is finally in place.
+            else if (wasIdle) this.console.log('HomeKit HEVC recording buffer ready: publishing point, client identity'
+                + `${this.uploadMode === 'cenc' ? ' and Camera Key' : ''} provisioned; CMAF upload mode '${this.uploadMode}'`);
         }
         if (reason) {
             for (const id of this.uploads.keys()) this.stopUpload(id);
@@ -775,15 +809,16 @@ export class Hksv27Camera {
         }
         if (this.uploads.size >= 6) throw new Error('Recording upload session limit reached');
         if (!this.publishingPoint?.url || !this.opts.recordingSource) throw new Error('Recording publishing point or source is unavailable');
-        // The public guide does not define how Camera Key encrypts/authenticates CMAF media.
-        // Never upload unprotected media while acknowledging a provisioned key.
-        if (this.storage.getItem(KEYS.cameraKey)) {
+        if (this.uploadMode === 'off') {
+            // The guide does not define how the Camera Key protects CMAF media, so uploading is
+            // opt-in. Refusing here is reported as a §4.11 CMAF Error rather than silence.
             this.appendEvent({ type: CameraBufferEventType.CMAF_ERROR, cmafSessionId: sessionId, error: CmafError.INVALID_STATE } as any);
-            throw new Error('Camera Key was provisioned, but the Apple CMAF media protection contract is unavailable in the public guide');
+            throw new Error('CMAF direct upload is off; enable "Experimental: HKSV CMAF Direct Upload" to record');
         }
         if (!this.opts.isRecordingActive?.()) throw new Error('Recording Active is off');
         if (!this.storage.getItem(KEYS.clientCertificate) || !this.storage.getItem(KEYS.clientKeyPem))
             throw new Error('Recording client identity has not been provisioned');
+        const protection = this.uploadMode === 'cenc' ? this.createProtection() : undefined;
         const window = this.recordingBuffer.open(start, stop, stopAction === BufferUploadStopAction.PAUSE);
         const clipId = this.nextClipId();
         const clientKeyPem = this.storage.getItem(KEYS.clientKeyPem) ?? undefined;
@@ -796,6 +831,7 @@ export class Hksv27Camera {
             clientCertificateDer: clientCertificate ? Buffer.from(clientCertificate, 'base64') : undefined,
             clientCaDer: clientCa ? Buffer.from(clientCa, 'base64') : undefined,
             clientPrivateKeyPem: clientKeyPem,
+            clipId, protection,
         }, sessionId, this.console, {
             onError: error => this.appendEvent({ type: CameraBufferEventType.CMAF_ERROR, cmafSessionId: sessionId, error } as any),
             onStopped: () => {
@@ -809,9 +845,22 @@ export class Hksv27Camera {
         this.uploads.set(sessionId, upload);
 
         this.appendEvent({ type: CameraBufferEventType.CMAF_SESSION_START, cmafSessionId: sessionId } as any);
-        this.console.log(`CMAF upload session ${sessionId} started (clip ${clipId})`);
+        this.console.log(`CMAF upload session ${sessionId} started: clip ${clipId} to `
+            + `${new URL(this.publishingPoint.url).origin}/…/${ingest.objectPath('')}; `
+            + (protection ? `cenc under Camera Key ${protection.keyNumber}, KID ${protection.kid.toString('hex')}`
+                : 'unencrypted (diagnostic mode)'));
         ingest.run(window).catch(e => this.console.error('CMAF ingest run failed', e));
         return clipId;
+    }
+
+    /** Builds the Camera Key protection for one clip, reserving the IVs it may spend. */
+    private createProtection(): CmafCencProtection {
+        const key = this.storage.getItem(KEYS.cameraKey);
+        if (!key) throw new Error('Camera Key has not been provisioned');
+        const keyNumber = BigInt(this.storage.getItem(KEYS.cameraKeyNumber) || '0');
+        const reserved = BigInt(this.storage.getItem(KEYS.cameraKeyIv) || '0');
+        this.storage.setItem(KEYS.cameraKeyIv, (reserved + IV_RESERVATION).toString());
+        return new CmafCencProtection(Buffer.from(key, 'base64'), keyNumber, reserved);
     }
 
     private stopUpload(sessionId: bigint): void {
@@ -848,13 +897,18 @@ export class Hksv27Camera {
                 const parsed = parseCameraKey(Buffer.from(value, 'base64'));
                 if (!parsed.key.length) throw new Error('Camera Key is empty');
                 for (const id of this.uploads.keys()) this.stopUpload(id);
-                this.storage.setItem(KEYS.cameraKey, parsed.key.toString('base64'));
+                const encoded = parsed.key.toString('base64');
+                // A new key starts a fresh IV space; rewriting the same key must not, or the
+                // counter would hand out IVs earlier clips already used under it.
+                if (this.storage.getItem(KEYS.cameraKey) !== encoded) this.storage.setItem(KEYS.cameraKeyIv, '0');
+                this.storage.setItem(KEYS.cameraKey, encoded);
                 this.storage.setItem(KEYS.cameraKeyNumber, parsed.keyNumber.toString());
                 this.updateRecorder();
                 this.keyIdValue = buildCameraKeyID(parsed.keyNumber).toString('base64');
                 keyIdChar.updateValue(this.keyIdValue);
                 recordBisectSignal(this.storage, 'Camera Key written');
-                this.console.log(`HomeKit camera key ${parsed.keyNumber} provisioned (${parsed.key.length} bytes)`);
+                this.console.log(`HomeKit camera key ${parsed.keyNumber} provisioned (${parsed.key.length} bytes); `
+                    + `CMAF upload mode '${this.uploadMode}'`);
                 cb(null);
             }
             catch (e) {

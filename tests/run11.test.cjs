@@ -5,7 +5,7 @@ const tick = () => new Promise(setImmediate);
 const write = (characteristic, value) => new Promise((resolve, reject) =>
     characteristic.emit('set', value, error => error ? reject(error) : resolve()));
 
-function fixture(source) {
+function fixture(source, cmafUploadMode = 'clear') {
     const env = environment({ realHap: true });
     const hap = env.load('./src/hap.ts');
     const protocol = env.load(base + 'hksv-recording-protocol.ts');
@@ -16,7 +16,7 @@ function fixture(source) {
     const { Hksv27Camera } = env.load(base + 'camera-hksv27.ts');
     const camera = new Hksv27Camera(acc, { handleStreamRequest(req, cb) { cb(); } }, state,
         { ...quiet, log(message) { logs.push(message); } },
-        { sensorClass: '4k', sensorWidth: 3840, sensorHeight: 2160, recordingSource: source });
+        { sensorClass: '4k', sensorWidth: 3840, sensorHeight: 2160, recordingSource: source, cmafUploadMode });
     const recording = new hap.Service.CameraRecordingManagement('Recording');
     acc.addService(recording);
     camera.attachRecordingManagement(recording);
@@ -77,20 +77,25 @@ test('recorder replacement waits for asynchronous cleanup and unpair cannot rest
     } finally { finishOld?.(); f.camera.handleFactoryReset(); }
 });
 
-test('Camera Key stops unusable encoding and repeated Active writes keep it idle', async () => {
+test('an encrypted upload waits for the Camera Key, then records once the controller sends it', async () => {
     let starts = 0, stopped = false;
     const f = fixture(async function* (_tier, signal) {
         starts++;
         await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
         stopped = true;
-    });
+    }, 'cenc');
     try {
-        await f.provision(); f.active.updateValue(1); await tick(); assert.equal(starts, 1);
-        await write(f.char('Camera Key'), f.protocol.encodeCameraKey({ key: Buffer.alloc(32, 7), keyNumber: 1n }).toString('base64'));
-        await tick(); assert(stopped);
+        // Everything but the key: r43 would have recorded here, and r44 has nothing to encrypt with.
+        await f.provision(); f.active.updateValue(1); await tick(); assert.equal(starts, 0);
+        assert.equal(f.logs.filter(l => l.includes('recording buffer idle: waiting for the Camera Key')).length, 1);
         for (let i = 0; i < 10; i++) f.active.updateValue(1);
+        await tick(); assert.equal(starts, 0);
+        await write(f.char('Camera Key'), f.protocol.encodeCameraKey({ key: Buffer.alloc(32, 7), keyNumber: 1n }).toString('base64'));
+        await tick(); assert.equal(starts, 1); assert(!stopped);
+        // Rewriting the same key is not a rotation and must not restart the recorder.
+        await write(f.char('Camera Key'), f.protocol.encodeCameraKey({ key: Buffer.alloc(32, 7), keyNumber: 1n }).toString('base64'));
         await tick(); assert.equal(starts, 1);
-        assert.equal(f.logs.filter(l => l.includes('recording buffer idle: Camera Key')).length, 1);
+        f.active.updateValue(0); await tick(); assert(stopped);
     } finally { f.camera.handleFactoryReset(); }
 });
 
