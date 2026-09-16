@@ -6,7 +6,7 @@ import sdk, { AudioSensor, Camera, DeviceProvider, FFmpegInput, Intercom, Motion
 import { DummyDevice, addSupportedType, bindCharacteristic } from '../common';
 import { AudioRecordingCodec, AudioRecordingCodecType, AudioRecordingSamplerate, AudioStreamingCodec, AudioStreamingCodecType, AudioStreamingSamplerate, CameraController, CameraRecordingConfiguration, CameraRecordingDelegate, CameraRecordingOptions, CameraStreamingOptions, Characteristic, CharacteristicEventTypes, EventTriggerOption, H264Level, H264Profile, MediaContainerType, RecordingPacket, SRTPCryptoSuites, Service, VideoCodecType, WithUUID } from '../hap';
 import type { HomeKitPlugin } from '../main';
-import { enableHksv27Camera } from './camera/camera-hksv27';
+import { CmafUploadMode, enableHksv27Camera } from './camera/camera-hksv27';
 import { pickSensorClass, recordBisectSignal } from './camera/camera-multitier';
 import { handleFragmentsRequests, iframeIntervalSeconds } from './camera/camera-recording';
 import { createCameraStreamingDelegate } from './camera/camera-streaming';
@@ -236,12 +236,18 @@ addSupportedType({
                 const sensorClass = pickSensorClass(maxWidth, maxHeight);
 
                 const capabilitiesDataVersion = parseInt(storage.getItem('hksv27CapabilitiesDataVersion') || '1') || 1;
+                // r44: what a §4.9 upload does with the media. See camera-mixin's
+                // "Experimental: HKSV CMAF Direct Upload" setting.
+                const cmafUploadMode: CmafUploadMode =
+                    storage.getItem('hksv27CmafUploadMode') === 'Encrypted with the Camera Key (experimental)' ? 'cenc'
+                        : storage.getItem('hksv27CmafUploadMode') === 'Unencrypted (diagnostic)' ? 'clear' : 'off';
                 hksv27 = enableHksv27Camera(accessory, delegate, storage, console, {
                     sensorClass,
                     sensorWidth: maxWidth,
                     sensorHeight: maxHeight,
                     frameRate: nativeFrameRate,
                     capabilitiesDataVersion,
+                    cmafUploadMode,
                     // Reuse CameraController's snapshot privacy gates and the existing
                     // Scrypted JPEG delegate for the experimental HDS snapshot transfer.
                     takeSnapshot: request => (controller as any).handleSnapshotRequest(

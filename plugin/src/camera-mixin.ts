@@ -90,6 +90,17 @@ export function createCameraStorageSettings(device: StorageSettingsDevice) {
             defaultValue: true,
             description: 'Sign the HKSV client-certificate provisioning nonce with a raw 64-byte (IEEE P1363) ECDSA signature instead of DER/X9.62. Field-validated: Apple only accepts P1363 (leave enabled).',
         },
+        hksv27CmafUploadMode: {
+            title: 'Experimental: HKSV CMAF Direct Upload (r44)',
+            type: 'string',
+            choices: [
+                'Off (default)',
+                'Encrypted with the Camera Key (experimental)',
+                'Unencrypted (diagnostic)',
+            ],
+            defaultValue: 'Off (default)',
+            description: 'On iOS/tvOS 27 a camera uploads its own HomeKit Secure Video clips straight to Apple, with no Apple TV or HomePod in the media path — so Scrypted makes that HTTPS connection itself. Apple\'s open-source guide defines the provisioning (publishing point, client certificate, Camera Key) but never says how the Camera Key protects the media. "Encrypted with the Camera Key" applies MPEG Common Encryption (cenc, AES-128-CTR) using the key the controller provisioned, which is the reading that fits the specification; it is unconfirmed against Apple. "Unencrypted" uploads the clip protected only by the mutually-authenticated TLS connection, which isolates the transport from the encryption while testing — the clip is readable at the far end, so leave it off unless you are diagnosing an upload. Off refuses uploads and reports Invalid State, as earlier releases did.',
+        },
         hksv27DisabledServices: {
             title: 'Experimental: Disable HKSV-27 Services (bisect)',
             type: 'string',

@@ -6,18 +6,18 @@ A patched build of the [Scrypted](https://github.com/koush/scrypted) HomeKit plu
 
 ## Status
 
-**r42 is the current known-working release. r43 is a pre-release under test.**
+**r42 is the current known-working release. r43 and r44 are pre-releases under test.**
 
-| Scenario | r42 (known working) | r43 (pre-release) |
-| --- | --- | --- |
-| Live view at home (Multi-Tier RTP, native HEVC up to 4K) | Works | Unchanged |
-| Live view away from home at the default 360p (WebRTC through Apple's relay) | Works, with video and audio | Unchanged |
-| 1080p away from home | Works: re-encoded at 4 Mbps | Unchanged |
-| 4K away from home | Works: the camera's own 4K HEVC stream, sent without re-encoding | Unchanged |
-| 1440p away from home | Untested | Untested |
-| Talkback from the Home app | Not played on the camera | Not played on the camera |
-| HomeKit Secure Video recording | Not verified | Not verified |
-| iOS 27 CMAF direct upload | Not working | Not working |
+| Scenario | r42 (known working) | r43 (pre-release) | r44 (pre-release) |
+| --- | --- | --- | --- |
+| Live view at home (Multi-Tier RTP, native HEVC up to 4K) | Works | Unchanged | Unchanged |
+| Live view away from home at the default 360p (WebRTC through Apple's relay) | Works, with video and audio | Unchanged | Unchanged |
+| 1080p away from home | Works: re-encoded at 4 Mbps | Unchanged | Unchanged |
+| 4K away from home | Works: the camera's own 4K HEVC stream, sent without re-encoding | Unchanged | Unchanged |
+| 1440p away from home | Untested | Untested | Untested |
+| Talkback from the Home app | Not played on the camera | Not played on the camera | Unchanged |
+| HomeKit Secure Video recording | Not verified | Not verified | Not verified |
+| iOS 27 CMAF direct upload | Refused | Refused | Implemented, opt-in, unverified against Apple |
 
 r43 sends exactly what r42 sends. It only removes work the plugin was doing per
 packet on its own event loop: about half of it at 4K. Nothing about the picture
@@ -25,21 +25,28 @@ should change, which is what makes it a pre-release rather than a known-working
 build — it has passed its checks but has not yet been watched on a camera. See
 [R43-TESTING.md](R43-TESTING.md).
 
+r44 implements the iOS 27 direct upload path: the plugin posts HomeKit Secure Video
+clips to Apple's publishing point itself, with no Apple TV or HomePod in the media
+path. It is off by default, and the parts of the contract Apple has not published are
+marked as inference throughout. See [CMAF-UPLOAD.md](CMAF-UPLOAD.md) for what is
+specified and what is not, and [R44-TESTING.md](R44-TESTING.md) for how to test it.
+
 ## Install
 
-1. From [Releases](https://github.com/Altair571/homekitnew/releases), download `plugin-hevc-webrtc-rNN.zip` and `Install-Scrypted-Plugin-rNN.command` from the same release into one folder. [r42](https://github.com/Altair571/homekitnew/releases/tag/r42) is known working and [r43](https://github.com/Altair571/homekitnew/releases/tag/r43) is the pre-release; earlier releases stay available for rollback.
+1. From [Releases](https://github.com/Altair571/homekitnew/releases), download `plugin-hevc-webrtc-rNN.zip` and `Install-Scrypted-Plugin-rNN.command` from the same release into one folder. [r42](https://github.com/Altair571/homekitnew/releases/tag/r42) is known working, and r43 and r44 are pre-releases; earlier releases stay available for rollback.
 2. Run the installer with your Scrypted server address:
 
    ```bash
-   python3 Install-Scrypted-Plugin-r43.command --server https://your-scrypted-host:10443
+   python3 Install-Scrypted-Plugin-r44.command --server https://your-scrypted-host:10443
    ```
 
    It checks the ZIP's SHA-256, asks for your Scrypted username and password (never saved), and uploads the ZIP to the existing HomeKit plugin.
-3. Confirm the HomeKit plugin console shows the build, for example `hevc-fixes-2026-09-16-r43`.
+3. Confirm the HomeKit plugin console shows the build, for example `hevc-fixes-2026-09-16-r44`.
 4. In the camera's HomeKit settings, enable **Experimental: HEVC / 4K Streaming and HKSV (iOS/tvOS 27+)**.
 5. Optional: choose the remote quality with **Experimental: WebRTC Remote Resolution (r42)** and **Experimental: WebRTC Remote Video Bitrate (r42)**. 360p is the default.
+6. On r44, optionally turn on **Experimental: HKSV CMAF Direct Upload (r44)** to let the plugin upload HomeKit Secure Video clips to Apple itself. It is off by default; see [R44-TESTING.md](R44-TESTING.md).
 
-Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md`, `R41-TESTING.md`, `R42-TESTING.md`, `R43-TESTING.md`) describes what to check after installing.
+Each release's `HEVC-TESTING.md` (in this repository: `R40-TESTING.md` … `R44-TESTING.md`) describes what to check after installing.
 
 ## How remote HEVC works
 
@@ -79,28 +86,34 @@ Replaying 10 s of HEVC through the real send path, that is 12.3% of one core dow
 
 | Path | Contents |
 | --- | --- |
-| `plugin/` | Plugin source exactly as the latest build (r43) contains it. `build-r43-from-r42.py` asserts the two match. |
+| `plugin/` | Plugin source exactly as the latest build (r44) contains it, apart from the embedded build label. `build-r44-from-r43.py --verify-base` asserts the two match. |
 | `tests/` | Node test suite that runs against a built bundle, plus the installer tests |
-| `build-r39-from-r38.py` … `build-r43-from-r42.py` | Incremental release builders. Each patches the previous checksum-locked release ZIP. |
+| `build-r39-from-r38.py` … `build-r44-from-r43.py` | Incremental release builders. Each patches the previous checksum-locked release ZIP. |
 | `build-r35-from-r34.py` | Shared helpers the builders import |
-| `Install Scrypted Plugin.command` | The installer for the latest release (r43) |
-| `R39-TESTING.md` … `R43-TESTING.md` | Release notes and test steps |
+| `Install Scrypted Plugin.command` | The installer for the latest packaged release (r44) |
+| `R39-TESTING.md` … `R44-TESTING.md` | Release notes and test steps |
+| `CMAF-UPLOAD.md` | What Apple's HKSV guide specifies about direct upload, and what it leaves undefined |
 
 ## Building and running the tests
 
-Rebuilding r43 needs Node.js and Python 3, and the checksum-locked
-`plugin-hevc-webrtc-r42.zip` from the r42 release in the repository root. The build
-is deterministic: the bundle is always `06fc8efce65a8ad03db43c9994eb6832543cb5059158c264f8bab4be1ffbf5d2`.
+Rebuilding a release needs Node.js and Python 3, plus the checksum-locked ZIP of the
+release it builds from, in the repository root. Each build is deterministic: r43 is
+always `06fc8efce65a8ad03db43c9994eb6832543cb5059158c264f8bab4be1ffbf5d2` and r44 is
+always `65e910ad8a71cfe27a98c3feb7564c9ac7d6fddd601c1232ae2b2fc6470a9700`.
 
 ```bash
 npm ci
 curl -LO https://github.com/Altair571/homekitnew/releases/download/r42/plugin-hevc-webrtc-r42.zip
 python3 build-r43-from-r42.py                     # writes dist-r43/
-HK_TEST_BUNDLE=dist-r43/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs
-python3 tests/test_installer.py                   # checks the packaged r43 ZIP
+curl -LO https://github.com/Altair571/homekitnew/releases/download/r43/plugin-hevc-webrtc-r43.zip
+python3 build-r44-from-r43.py --verify-base       # writes dist-r44/
+HK_TEST_BUNDLE=dist-r44/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs
+python3 tests/test_installer.py                   # checks the packaged r44 ZIP
 ```
 
-`tests/r43-send-path.test.cjs` covers what r43 changed, including a digest of the
+`tests/cmaf-upload.test.cjs` covers what r44 changed, driving the whole provisioning
+sequence into a publishing point that requires the client certificate the plugin was
+issued. `tests/r43-send-path.test.cjs` covers what r43 changed, including a digest of the
 bytes the SFrame sender puts on the wire, which r42 produces too. Two tests,
 `real WebRTC ICE/DTLS/SRTP carries identical HEVC pictures`, drive a loopback WebRTC
 session through real ffmpeg. They send a 100-frame burst, so a host with a small
@@ -109,33 +122,33 @@ test; on Linux, `sysctl -w net.core.rmem_default=4194304` is enough. Limiting
 concurrency keeps the probe's decoder fixture inside its timeout on a small machine.
 
 Packaging is locked to a passing run: `--package` rebuilds the ZIP only if
-`diagnostics/r43-tests.json` records this exact bundle, a zero exit code, and the
-hash of `diagnostics/r43-tests.log`, and only if that log shows no failed or skipped
+`diagnostics/r44-tests.json` records this exact bundle, a zero exit code, and the
+hash of `diagnostics/r44-tests.log`, and only if that log shows no failed or skipped
 test. Record the run, then package:
 
 ```bash
 mkdir -p diagnostics
-HK_TEST_BUNDLE=dist-r43/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs > diagnostics/r43-tests.log; code=$?
+HK_TEST_BUNDLE=dist-r44/main.nodejs.js node --test --test-concurrency=2 tests/*.test.cjs > diagnostics/r44-tests.log; code=$?
 python3 - "$code" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-out = {'bundleSha256': hashlib.sha256(Path('dist-r43/main.nodejs.js').read_bytes()).hexdigest(),
+out = {'bundleSha256': hashlib.sha256(Path('dist-r44/main.nodejs.js').read_bytes()).hexdigest(),
        'returnCode': int(sys.argv[1]),
-       'logSha256': hashlib.sha256(Path('diagnostics/r43-tests.log').read_bytes()).hexdigest()}
-Path('diagnostics/r43-tests.json').write_text(json.dumps(out, indent=2) + '\n')
+       'logSha256': hashlib.sha256(Path('diagnostics/r44-tests.log').read_bytes()).hexdigest()}
+Path('diagnostics/r44-tests.json').write_text(json.dumps(out, indent=2) + '\n')
 PY
-python3 build-r43-from-r42.py --package
+python3 build-r44-from-r43.py --package
 ```
 
 The release's other two assets are copies of what the packaging step pinned, so they
 are generated rather than committed:
 
 ```bash
-cp "Install Scrypted Plugin.command" Install-Scrypted-Plugin-r43.command
-sha256sum plugin-hevc-webrtc-r43.zip Install-Scrypted-Plugin-r43.command > SHA256SUMS-r43.txt
+cp "Install Scrypted Plugin.command" Install-Scrypted-Plugin-r44.command
+sha256sum plugin-hevc-webrtc-r44.zip Install-Scrypted-Plugin-r44.command > SHA256SUMS-r44.txt
 ```
 
-Upload those two and the ZIP to the release, with `r43-release-notes.md` as its
+Upload those two and the ZIP to the release, with `r44-release-notes.md` as its
 description.
 
 To run the suite against an earlier release instead, unzip its bundle into `dist/`

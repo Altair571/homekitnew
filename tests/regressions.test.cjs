@@ -155,39 +155,71 @@ test('recording activity updates replace overlapping earlier exclusions',async()
     assert.deepEqual(chunks,['init','f1']);
 });
 
-test('CMAF stop interrupts a stalled source and waits for HTTP completion on success',async()=>{
-    const env=environment();const requests=[];
-    env.mock('https',{request(url,opts){const req=new EventEmitter();requests.push(req);req.url=url;req.opts=opts;
-        req.write=()=>true;req.destroy=()=>queueMicrotask(()=>req.emit('close'));req.end=()=>{req.ended=true;};return req;}});
+// r44 posts one CMAF object per request instead of streaming a clip through a single POST.
+function ingestMock(env){
+    const requests=[];
+    env.mock('https',{Agent:class{destroy(){}},request(url,opts){
+        const req=new EventEmitter();requests.push(req);req.url=url;req.opts=opts;
+        req.end=body=>{req.body=body;req.ended=true;};
+        req.destroy=()=>queueMicrotask(()=>req.emit('close'));return req;}});
+    const respond=(req,statusCode=200)=>{
+        const response=new EventEmitter();response.statusCode=statusCode;response.resume=()=>{};
+        req.emit('response',response);queueMicrotask(()=>response.emit('end'));};
+    return {requests,respond};
+}
+const tickOnce=()=>new Promise(setImmediate);
+// Each object is posted after its predecessor's response resolves, several awaits deep.
+async function nthRequest(requests,n){
+    for(let i=0;i<200&&requests.length<n;i++)await tickOnce();
+    assert.equal(requests.length,n,`request ${n} was issued`);
+    return requests[n-1];
+}
+const ingestTarget={publishingPointUrl:'https://camera.invalid/path/?token=example',serverCaCertificatesDer:[Buffer.from('ca')],
+    clientCertificateDer:Buffer.from('cert'),clientPrivateKeyPem:'key',clipId:9n};
+// r44 reads the init segment to brand it as a CMAF Header, so the source has to be real boxes.
+const emptyFtyp=Buffer.concat([Buffer.from([0,0,0,8]),Buffer.from('ftyp')]);
+
+test('CMAF stop interrupts a stalled session, and a clip completes only when the last object does',async()=>{
+    const env=environment();const {requests,respond}=ingestMock(env);
     const {CmafIngestSession}=env.load(base+'cmaf-ingest.ts');
-    const target={publishingPointUrl:'https://camera.invalid/path/?token=example',serverCaCertificatesDer:[Buffer.from('ca')],clientCertificateDer:Buffer.from('cert'),clientPrivateKeyPem:'key'};
-    let stopped=0,errors=0;
-    const session=new CmafIngestSession(target,1n,quiet,{onError(){errors++;},onStopped(){stopped++;}});
+    let stopped=0,errors=0;const callbacks={onError(){errors++;},onStopped(){stopped++;}};
+    const session=new CmafIngestSession(ingestTarget,1n,quiet,callbacks);
     const blocked={async *[Symbol.asyncIterator](){await never;yield Buffer.alloc(1);}};
-    const running=session.run(blocked);session.stop();await running;
+    const running=session.run(blocked);await tickOnce();session.stop();await running;
     assert.equal(stopped,1);assert.equal(errors,0);
-    const session2=new CmafIngestSession(target,2n,quiet,{onError(){errors++;},onStopped(){stopped++;}});
+    assert.equal(requests.length,1,'the stalled session got no further than its probe');
+
+    requests.length=0;
+    const session2=new CmafIngestSession(ingestTarget,2n,quiet,callbacks);
     let complete=false;
-    const finished=session2.run((async function*(){yield Buffer.from('mp4');})()).then(()=>complete=true);
-    await new Promise(setImmediate);const req=requests.at(-1);
-    assert.equal(req.ended,true);assert.equal(complete,false);
-    assert.equal(req.url.search,'?token=example');assert.equal(req.url.pathname,'/path/2.mp4');
-    const response=new EventEmitter();response.statusCode=201;response.resume=()=>{};
-    req.emit('response',response);assert.equal(complete,false);response.emit('end');await finished;
+    const finished=session2.run((async function*(){yield emptyFtyp;})()).then(()=>complete=true);
+    const probe=await nthRequest(requests,1);
+    assert.equal(probe.url.pathname,'/path/','the session opens with the connectivity probe');
+    assert.equal(probe.url.search,'?token=example','the publishing point query survives');
+    respond(probe);
+    const header=await nthRequest(requests,2);
+    assert.equal(header.url.pathname,'/path/9/init.mp4','the CMAF Header is named under the clip');
+    assert.equal(header.opts.headers['Content-Type'],'video/mp4');
+    assert.equal(complete,false);
+    respond(header,201);
+    const end=await nthRequest(requests,3);
+    assert.equal(end.url.pathname,'/path/9/','an empty mfra closes the clip');
+    assert.equal(complete,false,'the clip is not finished until its last object is acknowledged');
+    respond(end);await finished;
     assert.equal(stopped,2);assert.equal(errors,0);
 });
 
-test('CMAF premature connection closure releases a backpressure wait and reports one error',async()=>{
-    const env=environment();let request;
-    env.mock('https',{request(){const req=new EventEmitter();request=req;req.write=()=>false;req.end=()=>{};
-        req.destroy=()=>queueMicrotask(()=>req.emit('close'));return req;}});
+test('CMAF premature connection closure reports exactly one error',async()=>{
+    const env=environment();const {requests}=ingestMock(env);
     const {CmafIngestSession}=env.load(base+'cmaf-ingest.ts');
-    let stopped=0,errors=0;
-    const session=new CmafIngestSession({publishingPointUrl:'https://camera.invalid/',serverCaCertificatesDer:[Buffer.from('ca')],
-        clientCertificateDer:Buffer.from('cert'),clientPrivateKeyPem:'key'},1n,quiet,{onError(){errors++;},onStopped(){stopped++;}});
-    const finished=session.run((async function*(){yield Buffer.from('media');})());
-    await new Promise(setImmediate);request.emit('close');await finished;
-    assert.equal(stopped,1);assert.equal(errors,1);assert.equal(request.listenerCount('drain'),0);
+    const {CmafError}=env.load(base+'hksv-recording-protocol.ts');
+    let stopped=0;const reported=[];
+    const session=new CmafIngestSession(ingestTarget,1n,quiet,
+        {onError(error){reported.push(error);},onStopped(){stopped++;}});
+    const finished=session.run((async function*(){yield emptyFtyp;})());
+    await tickOnce();requests[0].emit('close');await finished;
+    assert.equal(stopped,1);
+    assert.deepEqual(reported,[CmafError.CONNECTION_FAILED]);
 });
 
 test('full new HAP service inventory constructs against the actual bundled HAP library',()=>{
