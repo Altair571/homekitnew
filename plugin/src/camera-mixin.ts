@@ -91,7 +91,7 @@ export function createCameraStorageSettings(device: StorageSettingsDevice) {
             description: 'Sign the HKSV client-certificate provisioning nonce with a raw 64-byte (IEEE P1363) ECDSA signature instead of DER/X9.62. Field-validated: Apple only accepts P1363 (leave enabled).',
         },
         hksv27CmafUploadMode: {
-            title: 'Experimental: HKSV CMAF Direct Upload (r44)',
+            title: 'Experimental: HKSV CMAF Direct Upload (r45)',
             type: 'string',
             choices: [
                 'Off (default)',

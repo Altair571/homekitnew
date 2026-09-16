@@ -155,7 +155,8 @@ test('recording activity updates replace overlapping earlier exclusions',async()
     assert.deepEqual(chunks,['init','f1']);
 });
 
-// r44 posts one CMAF object per request instead of streaming a clip through a single POST.
+// r44 posts one CMAF object per request instead of streaming a clip through a single POST;
+// r45 uploads the Push AV layout, one CMAF track file per track, opening with the manifest.
 function ingestMock(env){
     const requests=[];
     env.mock('https',{Agent:class{destroy(){}},request(url,opts){
@@ -163,12 +164,12 @@ function ingestMock(env){
         req.end=body=>{req.body=body;req.ended=true;};
         req.destroy=()=>queueMicrotask(()=>req.emit('close'));return req;}});
     const respond=(req,statusCode=200)=>{
-        const response=new EventEmitter();response.statusCode=statusCode;response.resume=()=>{};
+        const response=new EventEmitter();response.statusCode=statusCode;response.headers={};response.resume=()=>{};
         req.emit('response',response);queueMicrotask(()=>response.emit('end'));};
     return {requests,respond};
 }
 const tickOnce=()=>new Promise(setImmediate);
-// Each object is posted after its predecessor's response resolves, several awaits deep.
+// Each object is uploaded after its predecessor's response resolves, several awaits deep.
 async function nthRequest(requests,n){
     for(let i=0;i<200&&requests.length<n;i++)await tickOnce();
     assert.equal(requests.length,n,`request ${n} was issued`);
@@ -176,8 +177,11 @@ async function nthRequest(requests,n){
 }
 const ingestTarget={publishingPointUrl:'https://camera.invalid/path/?token=example',serverCaCertificatesDer:[Buffer.from('ca')],
     clientCertificateDer:Buffer.from('cert'),clientPrivateKeyPem:'key',clipId:9n};
-// r44 reads the init segment to brand it as a CMAF Header, so the source has to be real boxes.
-const emptyFtyp=Buffer.concat([Buffer.from([0,0,0,8]),Buffer.from('ftyp')]);
+// r45 splits the recording into tracks before anything is uploaded, so the source has to be a real clip.
+function recording(env){
+    const P=env.load(base+'hksv-cmaf-protection.ts');
+    return require('./cmaf-helpers.cjs').recordedClip(P.readBoxes);
+}
 
 test('CMAF stop interrupts a stalled session, and a clip completes only when the last object does',async()=>{
     const env=environment();const {requests,respond}=ingestMock(env);
@@ -187,23 +191,30 @@ test('CMAF stop interrupts a stalled session, and a clip completes only when the
     const blocked={async *[Symbol.asyncIterator](){await never;yield Buffer.alloc(1);}};
     const running=session.run(blocked);await tickOnce();session.stop();await running;
     assert.equal(stopped,1);assert.equal(errors,0);
-    assert.equal(requests.length,1,'the stalled session got no further than its probe');
+    assert.equal(requests.length,0,'a session with no media never contacts the publishing point');
 
     requests.length=0;
+    const clip=recording(env);
     const session2=new CmafIngestSession(ingestTarget,2n,quiet,callbacks);
     let complete=false;
-    const finished=session2.run((async function*(){yield emptyFtyp;})()).then(()=>complete=true);
-    const probe=await nthRequest(requests,1);
-    assert.equal(probe.url.pathname,'/path/','the session opens with the connectivity probe');
-    assert.equal(probe.url.search,'?token=example','the publishing point query survives');
-    respond(probe);
-    const header=await nthRequest(requests,2);
-    assert.equal(header.url.pathname,'/path/9/init.mp4','the CMAF Header is named under the clip');
-    assert.equal(header.opts.headers['Content-Type'],'video/mp4');
-    assert.equal(complete,false);
-    respond(header,201);
-    const end=await nthRequest(requests,3);
-    assert.equal(end.url.pathname,'/path/9/','an empty mfra closes the clip');
+    const finished=session2.run((async function*(){yield clip.init;yield clip.fragments[0];})()).then(()=>complete=true);
+    const manifest=await nthRequest(requests,1);
+    assert.equal(manifest.url.pathname,'/path/session_9/index.mpd','the manifest opens the clip under the Clip ID');
+    assert.equal(manifest.url.search,'?token=example','the publishing point query survives');
+    assert.equal(manifest.opts.method,'PUT');
+    assert.equal(manifest.opts.headers['Content-Type'],'application/dash+xml');
+    respond(manifest,201);
+    const expected=[['/path/session_9/video/video.init','video/mp4'],['/path/session_9/audio/audio.init','video/mp4'],
+        ['/path/session_9/video/segment_1001.m4s','video/iso.segment'],['/path/session_9/audio/segment_1001.m4s','video/iso.segment']];
+    for(const [i,[pathname,contentType]] of expected.entries()){
+        const object=await nthRequest(requests,i+2);
+        assert.equal(object.url.pathname,pathname,`object ${i+2} is named under the clip's session`);
+        assert.equal(object.opts.headers['Content-Type'],contentType);
+        assert.equal(complete,false);
+        respond(object);
+    }
+    const end=await nthRequest(requests,expected.length+2);
+    assert.equal(end.url.pathname,'/path/session_9/index.mpd','the complete manifest closes the clip');
     assert.equal(complete,false,'the clip is not finished until its last object is acknowledged');
     respond(end);await finished;
     assert.equal(stopped,2);assert.equal(errors,0);
@@ -216,8 +227,9 @@ test('CMAF premature connection closure reports exactly one error',async()=>{
     let stopped=0;const reported=[];
     const session=new CmafIngestSession(ingestTarget,1n,quiet,
         {onError(error){reported.push(error);},onStopped(){stopped++;}});
-    const finished=session.run((async function*(){yield emptyFtyp;})());
-    await tickOnce();requests[0].emit('close');await finished;
+    const clip=recording(env);
+    const finished=session.run((async function*(){yield clip.init;yield clip.fragments[0];})());
+    const first=await nthRequest(requests,1);first.emit('close');await finished;
     assert.equal(stopped,1);
     assert.deepEqual(reported,[CmafError.CONNECTION_FAILED]);
 });

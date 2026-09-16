@@ -7,24 +7,34 @@
  * HAP — it writes the publishing point (§4.13), provisions a client certificate (§4.25/§4.26)
  * and a Camera Key (§4.7), then sends Buffer Upload Commands (§4.9) — but the media never goes
  * through it. This plugin is the accessory, so Scrypted makes the HTTPS connection to Apple's
- * publishing point and posts the recording itself.
+ * publishing point and uploads the recording itself.
  *
- * The transport is the DASH-IF Live Media Ingest Protocol, Interface 1 (CMAF ingest): Apple's
- * §4.13 field is literally named `publishing_point_url` and carries DASH-IF's trailing-slash
- * requirement, and the §4.11 CMAF Error enumeration reads as that protocol's HTTP surface —
- * "HTTP Init Missing" is the 412 a publishing point returns when a media object arrives before
- * the CMAF Header for its track, which only happens when objects are posted separately.
+ * The object layout is the one the Matter Push AV Stream Transport cluster specifies for its
+ * CMAF ingest. Apple's iOS 27 HAP surface mirrors that cluster family service for service —
+ * WebRTC solicit-offer/provide-answer, client certificate provisioning, buffer upload commands,
+ * motion zones — and the reference camera in project-chip/connectedhomeip (examples/camera-app)
+ * is the client its ingest servers are validated against:
  *
- * So each CMAF object is one HTTP POST over a kept-alive mutually-authenticated connection:
+ *     PUT {publishing_point_url}session_{N}/index.mpd                the DASH manifest, first and last
+ *     PUT {publishing_point_url}session_{N}/{track}/{track}.init     one CMAF Header per track
+ *     PUT {publishing_point_url}session_{N}/{track}/segment_{S}.m4s  each CMAF fragment, S from 1001
  *
- *     POST {publishing_point_url}{clip}/init.mp4     the CMAF Header, once
- *     POST {publishing_point_url}{clip}/{n}.m4s      each CMAF fragment, in order
- *     POST {publishing_point_url}{clip}/            an empty mfra closes the clip
+ * with `video/mp4` for headers, `video/iso.segment` for fragments and `application/dash+xml`
+ * for the manifest: one object per request over a kept-alive mutually-authenticated connection,
+ * the manifest ahead of the media and again, complete, when the clip closes.
  *
- * VALIDATE: the path layout under the publishing point is the guessed part — the guide names no
- * verb, path or media type, and DASH-IF leaves the path to the ingest source beyond recommending
- * a $RepresentationID$/$Number$ shape. Every request logs its URL and status, so one real
- * session against Apple's publishing point shows what it actually expects.
+ * r44 guessed DASH-IF's `{clip}/init.mp4` and `{clip}/{n}.m4s` instead. A real session against
+ * Apple's publishing point (2026-09-16) answered 404 to that and to every other shape probed at
+ * the base URL — GET, HEAD, OPTIONS, PUT and POST on the publishing point itself, `init.mp4`,
+ * `{clip}/init.mp4`, `Streams({clip})`, `{clip}` and `{session}/init.mp4` — and `session_{N}/…`
+ * was not among them.
+ *
+ * VALIDATE: which identifier N is — the §4.9 Clip ID this accessory assigned, or the Session ID
+ * the controller chose — is not stated. Matter's camera assigns its CMAF session number itself,
+ * which is what the Clip ID is here, so the manifest is offered under the Clip ID first and, if
+ * the publishing point answers 404, under the Session ID; a 405 retries with POST. Every refusal
+ * is logged with its status, its headers and the start of its body, so one real session shows
+ * what Apple's publishing point expects.
  */
 
 import https from 'https';
@@ -32,10 +42,16 @@ import { Agent } from 'https';
 import { URL } from 'url';
 import { CmafError, cmafErrorForHttpStatus } from './hksv-recording-protocol';
 import { box, readBoxes } from './hksv-cmaf-protection';
+import { buildManifest, CmafSegmentEntry, CmafTrack, splitFragment, splitInit } from './hksv-cmaf-tracks';
 
 /** DASH-IF asks an ingest source to identify itself by brand, version and build. */
 const USER_AGENT = 'DASH-IF-Ingest/1.1 scrypted-homekit';
 const REQUEST_TIMEOUT_MS = 30000;
+/** The Matter reference numbers a session's segments from 1001. */
+export const FIRST_SEGMENT_NUMBER = 1001;
+/** How much of a refusal's body a log line shows. */
+const BODY_EXCERPT_BYTES = 240;
+const BODY_CAPTURE_BYTES = 4096;
 
 export interface CmafIngestTarget {
     /** The publishing_point_url from §4.13 (must end in a trailing slash). */
@@ -58,6 +74,8 @@ export interface CmafIngestTarget {
 export interface CmafMediaProtection {
     protectInit(init: Buffer): Buffer;
     protectFragment(fragment: Buffer): Buffer;
+    /** The default_KID the manifest announces, when the protection has one. */
+    readonly kid?: Buffer;
 }
 
 export interface CmafIngestCallbacks {
@@ -68,9 +86,43 @@ export interface CmafIngestCallbacks {
 }
 
 export interface CmafIngestSummary {
-    objects: number; bytes: number; retries: number; probeStatus?: number;
+    objects: number; bytes: number; retries: number; method: string; layout?: string;
     firstObjectMs?: number; elapsedMs: number; lastStatus?: number;
 }
+
+/** Where a clip's objects go, relative to the publishing point. */
+export interface CmafObjectLayout {
+    label: string;
+    manifest: string;
+    header(track: string): string;
+    segment(track: string, number: number): string;
+}
+
+/** The Matter Push AV Stream Transport layout: `session_<N>/<track>/…` under the publishing point. */
+export function pushAvLayout(sessionNumber: bigint, label: string): CmafObjectLayout {
+    const base = `session_${sessionNumber}/`;
+    return {
+        label,
+        manifest: `${base}index.mpd`,
+        header: track => `${base}${track}/${track}.init`,
+        segment: (track, number) => `${base}${track}/segment_${number}.m4s`,
+    };
+}
+
+/** The layouts a clip is offered under, in order: the Clip ID first, then the Session ID. */
+export function candidateLayouts(clipId: bigint, sessionId: bigint): CmafObjectLayout[] {
+    const layouts = [pushAvLayout(clipId, `Clip ID ${clipId}`)];
+    if (sessionId !== clipId) layouts.push(pushAvLayout(sessionId, `Session ID ${sessionId}`));
+    return layouts;
+}
+
+/** What the Matter reference camera sends for each kind of object, whatever the track holds. */
+const CONTENT_TYPES = {
+    manifest: 'application/dash+xml',
+    header: 'video/mp4',
+    segment: 'video/iso.segment',
+} as const;
+type ObjectKind = keyof typeof CONTENT_TYPES;
 
 export function derToPem(der: Buffer, label = 'CERTIFICATE'): string {
     const b64 = der.toString('base64').replace(/(.{64})/g, '$1\n').trimEnd();
@@ -78,7 +130,7 @@ export function derToPem(der: Buffer, label = 'CERTIFICATE'): string {
 }
 
 /**
- * Prepends a Segment Type box to a CMAF fragment that has none, so each posted object is a
+ * Prepends a Segment Type box to a CMAF fragment that has none, so each uploaded object is a
  * self-describing CMAF segment rather than a bare moof/mdat pair. The recorder's muxer omits it
  * because its output is one continuous file.
  */
@@ -102,17 +154,48 @@ export function cmafHeader(init: Buffer): Buffer {
         init.subarray(ftyp.start + ftyp.size)]);
 }
 
-/** DASH-IF signals the end of an ingest stream with an empty Movie Fragment Random Access box. */
-export function endOfStreamObject(): Buffer {
-    // mfro's size field counts the whole mfra: its own 8-byte header plus this 16-byte mfro.
-    return box('mfra', box('mfro', Buffer.from([0, 0, 0, 0, 0, 0, 0, 24])));
+/** A path with any long segment — the publishing point's token — cut down for a log line. */
+export function abbreviatePath(pathname: string): string {
+    return pathname.split('/').map(s => s.length > 32 ? `${s.slice(0, 6)}…(${s.length})` : s).join('/');
+}
+
+interface IngestResponse { status: number; headers: Record<string, string | string[] | undefined>; body: Buffer }
+
+/** The headers worth a log line when a publishing point refuses an object. */
+const DIAGNOSTIC_HEADERS = ['server', 'content-type', 'x-apple-request-uuid', 'x-apple-edge-response-time',
+    'www-authenticate', 'allow', 'location', 'retry-after'];
+
+/** "HTTP 404 — server: …; content-type: …; body: "…"" for a refusal, without the media. */
+export function describeResponse(response: IngestResponse): string {
+    const parts = DIAGNOSTIC_HEADERS.flatMap(name => {
+        const value = response.headers[name];
+        return value === undefined ? [] : [`${name}: ${Array.isArray(value) ? value.join(', ') : value}`];
+    });
+    if (response.body.length) {
+        const text = response.body.toString('latin1').replace(/[^\x20-\x7e]/g, '.');
+        parts.push(`body${response.body.length > BODY_EXCERPT_BYTES ? ` (${response.body.length} bytes)` : ''}: `
+            + `"${text.slice(0, BODY_EXCERPT_BYTES)}"`);
+    }
+    return parts.length ? ` — ${parts.join('; ')}` : '';
 }
 
 class HttpStatusError extends Error {
-    constructor(readonly status: number, url: string) { super(`HTTP ${status} from ${url}`); }
+    constructor(readonly status: number, readonly path: string, detail: string) {
+        super(`HTTP ${status} for ${path}${detail}`);
+    }
 }
 
 class TransportError extends Error {}
+
+class TimeoutError extends Error {}
+
+interface TrackState {
+    track: CmafTrack;
+    /** The track's CMAF Header as uploaded, so a 412 can have it again. */
+    header: Buffer;
+    next: number;
+    segments: CmafSegmentEntry[];
+}
 
 export class CmafIngestSession {
     private stopped = false;
@@ -123,28 +206,37 @@ export class CmafIngestSession {
     private readonly console: Console;
     private readonly callbacks: CmafIngestCallbacks;
     private readonly started = Date.now();
-    private init?: Buffer;
-    private summary: CmafIngestSummary = { objects: 0, bytes: 0, retries: 0, elapsedMs: 0 };
+    private readonly candidates: CmafObjectLayout[];
+    private readonly tracks = new Map<number, TrackState>();
+    private layout?: CmafObjectLayout;
+    private method: 'PUT' | 'POST' = 'PUT';
+    private releaseStop?: () => void;
+    /** Settles like an exhausted source when stop() is called, so a stalled source cannot hold run(). */
+    private readonly stopSignal = new Promise<IteratorResult<Buffer>>(resolve => {
+        this.releaseStop = () => resolve({ done: true, value: undefined });
+    });
+    private summary: CmafIngestSummary = { objects: 0, bytes: 0, retries: 0, method: 'PUT', elapsedMs: 0 };
 
     constructor(target: CmafIngestTarget, sessionId: bigint, console: Console, callbacks: CmafIngestCallbacks) {
         this.target = target;
         this.sessionId = sessionId;
         this.console = console;
         this.callbacks = callbacks;
+        this.candidates = candidateLayouts(target.clipId, sessionId);
     }
 
-    /** The object names this session posts, relative to the publishing point. */
-    objectPath(name: string): string {
-        return `${this.target.clipId}/${name}`;
+    /** The layouts this session offers, relative to the publishing point, for the start log line. */
+    describeObjects(): string {
+        return this.candidates.map(l => l.manifest.replace(/index\.mpd$/, '…')).join(', then ');
     }
 
     private url(name: string): URL {
         const url = new URL(this.target.publishingPointUrl);
-        url.pathname += this.objectPath(name);
+        url.pathname += name;
         return url;
     }
 
-    /** Streams a clip to the publishing point, one CMAF object per request. */
+    /** Uploads a clip to the publishing point, one CMAF object per request. */
     async run(source: AsyncIterable<Buffer>): Promise<void> {
         let iterator: AsyncIterator<Buffer> | undefined;
         let failure: CmafError | undefined;
@@ -171,34 +263,28 @@ export class CmafIngestSession {
             });
             if (this.stopped) return;
 
-            // DASH-IF opens with an empty request, which reports whether the publishing point is
-            // valid and what it requires before any media is spent on it. Its answer is
-            // diagnostic only: publishing points legitimately refuse a bodiless POST.
-            this.summary.probeStatus = await this.probe();
-
-            let number = 0;
             iterator = source[Symbol.asyncIterator]();
             while (!this.stopped && failure === undefined) {
-                const item = await iterator.next();
+                const item = await Promise.race([iterator.next(), this.stopSignal]);
                 if (item.done) break;
                 if (this.stopped || failure !== undefined) break;
-                if (!this.init) {
-                    this.init = cmafHeader(this.target.protection
-                        ? this.target.protection.protectInit(item.value) : item.value);
-                    await this.post('init.mp4', this.init);
-                    continue;
-                }
-                const fragment = cmafSegment(this.target.protection
-                    ? this.target.protection.protectFragment(item.value) : item.value);
-                await this.post(`${++number}.m4s`, fragment);
+                if (!this.tracks.size) { this.prepareHeaders(item.value); continue; }
+                const objects = this.prepareSegments(item.value);
+                // The first fragment fixes what the manifest can say, so the layout is settled
+                // — manifest, then headers — only now.
+                if (!this.layout) await this.open();
+                for (const object of objects) await this.uploadSegment(object.state, object.number, object.data);
             }
-            if (!this.stopped && failure === undefined && this.init) {
-                await this.post('', endOfStreamObject());
-                this.console.log(`CMAF session ${this.sessionId} uploaded ${this.summary.objects} object(s), `
-                    + `${this.summary.bytes} bytes in ${Date.now() - this.started} ms`
-                    + (this.summary.retries ? `, ${this.summary.retries} retried` : '')
-                    + `; publishing point ${new URL(this.target.publishingPointUrl).origin}`);
+            if (this.stopped || failure !== undefined) return;
+            if (!this.layout) {
+                this.console.log(`CMAF session ${this.sessionId}: the recording window closed before any media was produced; nothing uploaded`);
+                return;
             }
+            await this.upload('manifest', this.layout.manifest, Buffer.from(this.manifest(), 'utf8'));
+            this.console.log(`CMAF session ${this.sessionId} uploaded ${this.summary.objects} object(s), `
+                + `${this.summary.bytes} bytes in ${Date.now() - this.started} ms`
+                + (this.summary.retries ? `, ${this.summary.retries} retried` : '')
+                + `; ${this.method} under ${this.layout.label} at ${new URL(this.target.publishingPointUrl).origin}`);
         }
         catch (e: any) {
             // A redirect maps to CMAF Error "None", which would report success; anything the
@@ -220,58 +306,114 @@ export class CmafIngestSession {
         return { ...this.summary, elapsedMs: this.summary.elapsedMs || Date.now() - this.started };
     }
 
-    private async probe(): Promise<number | undefined> {
-        try {
-            const status = await this.send(new URL(this.target.publishingPointUrl), Buffer.alloc(0));
-            this.console.log(`CMAF session ${this.sessionId}: publishing point probe returned HTTP ${status}`);
-            return status;
+    /** One CMAF Header per track, protected if the session protects, held until the layout is known. */
+    private prepareHeaders(init: Buffer): void {
+        for (const track of splitInit(init)) {
+            const header = cmafHeader(this.target.protection ? this.target.protection.protectInit(track.header) : track.header);
+            this.tracks.set(track.trackId, { track, header, next: FIRST_SEGMENT_NUMBER, segments: [] });
         }
-        catch (e: any) {
-            if (e instanceof HttpStatusError) {
-                this.console.log(`CMAF session ${this.sessionId}: publishing point probe returned HTTP ${e.status}`);
-                return e.status;
-            }
-            throw e;
-        }
+    }
+
+    /** One CMAF fragment per track, numbered and listed for the manifest. */
+    private prepareSegments(fragment: Buffer) {
+        const tracks = new Map([...this.tracks].map(([id, state]) => [id, state.track]));
+        return splitFragment(fragment, tracks).map(part => {
+            const state = this.tracks.get(part.trackId)!;
+            const data = cmafSegment(this.target.protection ? this.target.protection.protectFragment(part.data) : part.data);
+            const number = state.next++;
+            state.segments.push({ number, decodeTime: part.decodeTime, duration: part.duration, bytes: data.length, samples: part.samples });
+            return { state, number, data };
+        });
+    }
+
+    private manifest(): string {
+        return buildManifest([...this.tracks.values()].map(s => ({ track: s.track, segments: s.segments })), {
+            initialization: t => `${t.name}/${t.name}.init`,
+            media: t => `${t.name}/segment_$Number$.m4s`,
+            startNumber: FIRST_SEGMENT_NUMBER,
+            kid: this.target.protection?.kid,
+        });
     }
 
     /**
-     * Posts one CMAF object. A publishing point that reports the init segment missing (412) has
-     * lost the track's CMAF Header — a new upstream instance, or a connection it did not keep —
-     * so the header is posted again and the object retried once.
+     * Settles the layout by offering the manifest under each candidate until the publishing point
+     * accepts one, then uploads every track's CMAF Header under it.
      */
-    private async post(name: string, body: Buffer, retried = false): Promise<void> {
-        const url = this.url(name);
+    private async open(): Promise<void> {
+        const manifest = Buffer.from(this.manifest(), 'utf8');
+        for (const [i, layout] of this.candidates.entries()) {
+            try {
+                await this.upload('manifest', layout.manifest, manifest);
+            }
+            catch (e: any) {
+                if (e instanceof HttpStatusError && e.status === 404 && i < this.candidates.length - 1) {
+                    this.console.log(`CMAF session ${this.sessionId}: ${e.message}; offering the manifest under `
+                        + `${this.candidates[i + 1].label} instead`);
+                    continue;
+                }
+                throw e;
+            }
+            this.layout = layout;
+            this.summary.layout = layout.label;
+            this.console.log(`CMAF session ${this.sessionId}: publishing point accepted the manifest at `
+                + `${abbreviatePath(this.url(layout.manifest).pathname)} (${layout.label}, ${this.method})`);
+            break;
+        }
+        for (const state of this.tracks.values())
+            await this.upload('header', this.layout!.header(state.track.name), state.header);
+    }
+
+    /**
+     * Uploads one CMAF fragment. A publishing point that reports the header missing (412) has
+     * lost the track's CMAF Header — a new upstream instance, or a connection it did not keep —
+     * so the header is uploaded again and the fragment retried once.
+     */
+    private async uploadSegment(state: TrackState, number: number, data: Buffer): Promise<void> {
+        const name = this.layout!.segment(state.track.name, number);
         try {
-            const status = await this.send(url, body);
-            this.summary.lastStatus = status;
-            this.summary.objects++; this.summary.bytes += body.length;
-            this.summary.firstObjectMs ??= Date.now() - this.started;
-            if (this.summary.objects === 1)
-                this.console.log(`CMAF session ${this.sessionId}: HTTP ${status} for ${url.pathname} `
-                    + `(${body.length} bytes, ${this.target.protection ? 'Camera Key protected' : 'unprotected'})`);
+            await this.upload('segment', name, data);
         }
         catch (e: any) {
-            const status = e instanceof HttpStatusError ? e.status : undefined;
-            this.console.error(`CMAF session ${this.sessionId}: ${e?.message} for ${url.pathname}`);
-            if (this.stopped) return;
-            if (status === 412 && !retried && this.init && name !== 'init.mp4') {
-                this.summary.retries++;
-                await this.post('init.mp4', this.init, true);
-                await this.post(name, body, true);
-                return;
-            }
-            throw e;
+            if (!(e instanceof HttpStatusError) || e.status !== 412 || this.stopped) throw e;
+            this.summary.retries++;
+            this.console.log(`CMAF session ${this.sessionId}: ${e.message}; uploading the ${state.track.name} header again`);
+            await this.upload('header', this.layout!.header(state.track.name), state.header);
+            await this.upload('segment', name, data);
         }
     }
 
-    private send(url: URL, body: Buffer): Promise<number> {
-        return new Promise<number>((resolve, reject) => {
+    private async upload(kind: ObjectKind, name: string, body: Buffer): Promise<void> {
+        const url = this.url(name);
+        const status = await this.send(url, kind, body);
+        this.summary.lastStatus = status;
+        this.summary.objects++; this.summary.bytes += body.length;
+        this.summary.firstObjectMs ??= Date.now() - this.started;
+        if (this.summary.objects === 1)
+            this.console.log(`CMAF session ${this.sessionId}: HTTP ${status} for ${abbreviatePath(url.pathname)} `
+                + `(${this.method}, ${body.length} bytes, ${this.target.protection ? 'Camera Key protected' : 'unprotected'})`);
+    }
+
+    /** One request. A 405 to a PUT switches the session to POST and repeats the request. */
+    private async send(url: URL, kind: ObjectKind, body: Buffer): Promise<number> {
+        let response = await this.exchange(url, kind, body);
+        if (response.status === 405 && this.method === 'PUT') {
+            this.console.log(`CMAF session ${this.sessionId}: HTTP 405 for ${abbreviatePath(url.pathname)}`
+                + `${describeResponse(response)}; switching to POST`);
+            this.method = 'POST'; this.summary.method = 'POST';
+            response = await this.exchange(url, kind, body);
+        }
+        if (response.status >= 200 && response.status < 300) return response.status;
+        throw new HttpStatusError(response.status, abbreviatePath(url.pathname),
+            ` (${this.method}, ${body.length} bytes)${describeResponse(response)}`);
+    }
+
+    private exchange(url: URL, kind: ObjectKind, body: Buffer): Promise<IngestResponse> {
+        return new Promise<IngestResponse>((resolve, reject) => {
             const request = https.request(url, {
-                method: 'POST', agent: this.agent, timeout: REQUEST_TIMEOUT_MS,
+                method: this.method, agent: this.agent, timeout: REQUEST_TIMEOUT_MS,
                 headers: {
                     'User-Agent': USER_AGENT,
-                    'Content-Type': 'video/mp4',
+                    'Content-Type': CONTENT_TYPES[kind],
                     'Content-Length': body.length,
                 },
             });
@@ -279,10 +421,15 @@ export class CmafIngestSession {
             let settled = false;
             const done = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
             request.on('response', response => {
-                const status = response.statusCode ?? 0;
-                response.resume();
-                response.on('end', () => done(() => status >= 200 && status < 300
-                    ? resolve(status) : reject(new HttpStatusError(status, url.pathname))));
+                const chunks: Buffer[] = [];
+                let captured = 0;
+                response.on('data', (chunk: Buffer) => {
+                    if (captured < BODY_CAPTURE_BYTES) chunks.push(chunk.subarray(0, BODY_CAPTURE_BYTES - captured));
+                    captured += chunk.length;
+                });
+                response.on('end', () => done(() => resolve({
+                    status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks),
+                })));
                 response.on('error', () => done(() => reject(new TransportError('Response interrupted'))));
                 response.on('aborted', () => done(() => reject(new TransportError('Response aborted'))));
             });
@@ -295,12 +442,11 @@ export class CmafIngestSession {
 
     stop(): void {
         this.stopped = true;
+        this.releaseStop?.();
         this.request?.destroy();
         this.agent?.destroy();
     }
 }
-
-class TimeoutError extends Error {}
 
 /** Maps a transport failure onto the §4.11 CMAF Error enumeration. Anything that is not a
  *  transport fault reached this client from the recording source or the protection layer, which
