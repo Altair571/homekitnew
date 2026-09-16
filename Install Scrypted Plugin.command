@@ -19,8 +19,8 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-DEFAULT_ZIP = 'plugin-hevc-webrtc-r44.zip'
-DEFAULT_SHA256 = '84664a7d02adb00815eb63f7bc0ca491bd41da67857e114313c5080b29b66115'
+DEFAULT_ZIP = 'plugin-hevc-webrtc-r45.zip'
+DEFAULT_SHA256 = '91f2b8ac9562ba65904d110b6fd85f8c4490c94f197b1c32ae261ade656fa2d1'
 PLUGIN = '@scrypted/homekit'
 DEPLOY_PATH = '/web/component/script/deploy?' + urlencode({'npmPackage': PLUGIN})
 
@@ -49,7 +49,7 @@ def read_plugin(path):
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     if path.name == DEFAULT_ZIP and digest != DEFAULT_SHA256:
-        raise InstallError('The r44 ZIP checksum does not match the tested build.')
+        raise InstallError('The r45 ZIP checksum does not match the tested build.')
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = archive.namelist()
