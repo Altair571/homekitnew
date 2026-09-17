@@ -1,5 +1,5 @@
 // Shared scaffolding for the CMAF direct-upload tests: a publishing point that behaves like a
-// DASH-IF Interface-1 server, and the recorded media the accessory uploads to it.
+// Matter Push AV Stream Transport ingest server, and the recorded media the accessory uploads to it.
 const fs = require('node:fs');
 const path = require('node:path');
 const https = require('node:https');
@@ -20,15 +20,24 @@ function recordedClip(readBoxes) {
 }
 
 /**
- * A publishing point that enforces the two behaviours the §4.11 error enumeration implies: it
- * requires the provisioned client certificate, and it rejects a media object for a clip whose
- * CMAF Header it has not seen with the 412 that maps to "HTTP Init Missing".
+ * A publishing point that speaks the Matter Push AV Stream Transport layout the plugin uploads
+ * to — `session_<N>/index.mpd`, `session_<N>/<track>/<track>.init`,
+ * `session_<N>/<track>/segment_<S>.m4s` — and enforces what the §4.11 error enumeration implies:
+ * it requires the provisioned client certificate, answers 404 for any other path, and rejects a
+ * media object for a track whose CMAF Header it has not seen with the 412 that maps to "HTTP
+ * Init Missing".
+ *
+ * Options shape the far end: `sessions` limits which session numbers exist (anything else is
+ * 404, the way a point keyed on one identifier looks to a client offering another), `methods`
+ * limits the verbs it allows (others get 405 with an Allow header), `failInitOnce` forgets the
+ * first header it is given, and `refuse` answers every request with that status and body.
  */
-function publishingPoint(pki, { failInitOnce = false } = {}) {
+function publishingPoint(pki, { failInitOnce = false, sessions, methods = ['PUT', 'POST'], refuse } = {}) {
   const objects = new Map();
   const requests = [];
   const seenInit = new Set();
   let forgetNextInit = failInitOnce;
+  const route = /^\/pp\/session_(\d+)\/(?:(index\.mpd)|([A-Za-z0-9]+)\/(?:\3\.init|segment_(\d+)\.m4s))$/;
   const server = https.createServer({
     key: pki.serverKey, cert: pki.serverCert, ca: pki.caPem,
     requestCert: true, rejectUnauthorized: true,
@@ -38,22 +47,27 @@ function publishingPoint(pki, { failInitOnce = false } = {}) {
     req.on('end', () => {
       const body = Buffer.concat(chunks);
       const url = req.url;
-      const clip = url.split('/').filter(Boolean)[1];
-      const name = url.endsWith('/') ? '' : url.split('/').pop();
+      const match = route.exec(url);
+      const session = match?.[1];
+      const track = match?.[3];
+      const name = url.split('/').pop();
       const peer = req.socket.getPeerCertificate();
-      requests.push({ url, name, bytes: body.length, subject: peer?.subject?.CN,
+      requests.push({ url, method: req.method, name, session, track, bytes: body.length, subject: peer?.subject?.CN,
         contentType: req.headers['content-type'], userAgent: req.headers['user-agent'] });
-      if (name === 'init.mp4') {
+      if (refuse) { res.writeHead(refuse.status, refuse.headers ?? {}); res.end(refuse.body ?? ''); return; }
+      if (!match || (sessions && !sessions.map(String).includes(session))) { res.writeHead(404); res.end(); return; }
+      if (!methods.includes(req.method)) { res.writeHead(405, { Allow: methods.join(', ') }); res.end(); return; }
+      if (name.endsWith('.init')) {
         // Accepting a header and then losing it is what a restarted or rebalanced publishing
         // point looks like from the outside: the next media object gets a 412.
         if (forgetNextInit) forgetNextInit = false;
-        else seenInit.add(clip);
+        else seenInit.add(`${session}/${track}`);
       }
-      else if (name.endsWith('.m4s') && !seenInit.has(clip)) {
+      else if (name.endsWith('.m4s') && !seenInit.has(`${session}/${track}`)) {
         res.writeHead(412); res.end(); return;   // the publishing point has no CMAF Header
       }
       objects.set(url, body);
-      res.writeHead(name === '' && !body.length ? 202 : 200); res.end();
+      res.writeHead(name === 'index.mpd' ? 201 : 200); res.end();
     });
   });
   return {
@@ -62,17 +76,38 @@ function publishingPoint(pki, { failInitOnce = false } = {}) {
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       return `https://localhost:${server.address().port}/pp/`;
     },
-    /** The clip as the publishing point would reassemble it: header then fragments in order. */
-    clip(clipId) {
-      const init = objects.get(`/pp/${clipId}/init.mp4`);
+    /** A track as the publishing point would reassemble it: header then fragments in order. */
+    track(session, name) {
+      const prefix = `/pp/session_${session}/${name}/`;
+      const init = objects.get(`${prefix}${name}.init`);
       const media = [...objects.entries()]
-        .filter(([url]) => url.startsWith(`/pp/${clipId}/`) && url.endsWith('.m4s'))
-        .sort((a, b) => parseInt(a[0].split('/').pop()) - parseInt(b[0].split('/').pop()))
+        .filter(([url]) => url.startsWith(prefix) && url.endsWith('.m4s'))
+        .sort((a, b) => parseInt(a[0].split('_').pop()) - parseInt(b[0].split('_').pop()))
         .map(([, body]) => body);
       return { init, media };
     },
+    manifest(session) { return objects.get(`/pp/session_${session}/index.mpd`)?.toString('utf8'); },
     close() { return new Promise(resolve => server.close(resolve)); },
   };
+}
+
+/**
+ * The recording as the plugin splits it: one CMAF Header and one fragment per fragment for each
+ * track, keyed by the track's object name, built with the plugin's own module so an upload test
+ * compares what arrived against the bytes that were meant to leave.
+ */
+function splitTracks(T, clip) {
+  const tracks = T.splitInit(clip.init);
+  const byId = new Map(tracks.map(t => [t.trackId, t]));
+  const out = Object.fromEntries(tracks.map(t => [t.name, { init: t.header, media: [], entries: [] }]));
+  for (const fragment of clip.fragments) {
+    for (const part of T.splitFragment(fragment, byId)) {
+      const track = out[byId.get(part.trackId).name];
+      track.media.push(part.data);
+      track.entries.push(part);
+    }
+  }
+  return out;
 }
 
 /**
@@ -151,4 +186,4 @@ function trunSamples(buf, moof, mdat, tfhd, kids) {
   return samples;
 }
 
-module.exports = { recordedClip, publishingPoint, decryptClip, trunSamples };
+module.exports = { recordedClip, publishingPoint, decryptClip, trunSamples, splitTracks };

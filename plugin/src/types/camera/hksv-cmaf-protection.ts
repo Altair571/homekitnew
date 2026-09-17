@@ -98,6 +98,7 @@ export class CmafCencProtection {
     private readonly tracks = new Map<number, ProtectedTrack>();
     private readonly formats = new Map<number, string>();
     private counter: bigint;
+    private registered = 0;
     private samplesEncrypted = 0;
     private bytesEncrypted = 0;
     private clearBytes = 0;
@@ -137,14 +138,18 @@ export class CmafCencProtection {
     // CMAF Header (init segment)
     // ------------------------------------------------------------------
 
-    /** Rewrites the init segment's sample entries as 'encv'/'enca' with a 'cenc' sinf. */
+    /**
+     * Rewrites the init segment's sample entries as 'encv'/'enca' with a 'cenc' sinf. The tracks
+     * it finds join those of any header protected before it: a recording split into one CMAF
+     * Header per track (hksv-cmaf-tracks.ts) is protected under one key and one IV counter.
+     */
     protectInit(init: Buffer): Buffer {
-        this.tracks.clear(); this.formats.clear();
+        const before = this.registered;
         const out = readBoxes(init).map(top => top.type === 'moov'
             ? box('moov', ...children(init, top).map(child =>
                 child.type === 'trak' ? this.protectTrak(init, child) : slice(init, child)))
             : slice(init, top));
-        if (!this.tracks.size)
+        if (this.registered === before)
             throw new Error('The recording init segment has no HEVC or AAC track to protect');
         return Buffer.concat(out);
     }
@@ -169,6 +174,7 @@ export class CmafCencProtection {
                 ? { kind: 'audio', lengthSize: 0, nalHeaderBytes: 0 }
                 : { kind: 'video', lengthSize: nalLengthSize(buf, entry), nalHeaderBytes });
             this.formats.set(trackId, entry.type);
+            this.registered++;
             return box(audio ? 'enca' : 'encv', payload, this.sinf(entry.type));
         });
         return box('stsd', head, ...entries);

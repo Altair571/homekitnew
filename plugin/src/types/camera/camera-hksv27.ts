@@ -87,7 +87,7 @@ import { buildClientCSR, createClientIdentity, loadClientIdentity, signNonce } f
 import { HksvRecordingBuffer, RecordingWindow } from './hksv-recording-buffer';
 import { RecordingSourceItem } from './camera-cmaf-source';
 import { CmafIngestSession } from './cmaf-ingest';
-import { CmafCencProtection } from './hksv-cmaf-protection';
+import { CENC_KEY_BYTES, CmafCencProtection } from './hksv-cmaf-protection';
 import { deriveSensorUuid, logCharacteristicReads, MinimalStorage, MultiTierStreamManagement, recordBisectSignal, setBisectReadTallyStorage, StreamingGate } from './camera-multitier';
 import { WebRTCStreamManagement } from './camera-webrtc';
 import { buildSensorVideoTiers, SensorClass, VideoStreamTier } from './hksv-stream-tiers';
@@ -846,9 +846,14 @@ export class Hksv27Camera {
 
         this.appendEvent({ type: CameraBufferEventType.CMAF_SESSION_START, cmafSessionId: sessionId } as any);
         this.console.log(`CMAF upload session ${sessionId} started: clip ${clipId} to `
-            + `${new URL(this.publishingPoint.url).origin}/…/${ingest.objectPath('')}; `
+            + `${new URL(this.publishingPoint.url).origin}/…/${ingest.describeObjects()}; `
             + (protection ? `cenc under Camera Key ${protection.keyNumber}, KID ${protection.kid.toString('hex')}`
                 : 'unencrypted (diagnostic mode)'));
+        const keyBytes = protection?.snapshot().keyBytes;
+        if (keyBytes !== undefined && keyBytes !== CENC_KEY_BYTES)
+            this.console.warn(`CMAF upload session ${sessionId}: the Camera Key is ${keyBytes} bytes and the cenc reading `
+                + `assumes ${CENC_KEY_BYTES}; a refusal of the media may be the protection rather than the layout, `
+                + `which "Unencrypted (diagnostic)" separates`);
         ingest.run(window).catch(e => this.console.error('CMAF ingest run failed', e));
         return clipId;
     }

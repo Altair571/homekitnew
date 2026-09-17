@@ -1,16 +1,18 @@
-// iOS 27 CMAF direct upload (r44). On iOS/tvOS 27 the accessory posts its own HomeKit Secure
-// Video clips to Apple's publishing point with no home hub in the media path, so these tests
-// drive the whole §3.5/§3.9/§3.10 provisioning sequence through the real HAP characteristics and
-// watch the clip land on a publishing point that demands the certificate the plugin was issued.
+// iOS 27 CMAF direct upload (r44, layout r45). On iOS/tvOS 27 the accessory uploads its own
+// HomeKit Secure Video clips to Apple's publishing point with no home hub in the media path, so
+// these tests drive the whole §3.5/§3.9/§3.10 provisioning sequence through the real HAP
+// characteristics and watch the clip land on a publishing point that demands the certificate
+// the plugin was issued and speaks the Matter Push AV Stream Transport layout.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { environment, base, storage, quiet } = require('./helpers.cjs');
 const pki = require('./cmaf-pki.cjs');
-const { recordedClip, publishingPoint, decryptClip } = require('./cmaf-helpers.cjs');
+const { recordedClip, publishingPoint, decryptClip, splitTracks } = require('./cmaf-helpers.cjs');
 
 const CAMERA_KEY = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
 const KEY_NUMBER = 42n;
+const SESSION_ID = 7n;
 
 function accessory(env, options) {
   const hap = env.load('./src/hap.ts');
@@ -30,7 +32,7 @@ function accessory(env, options) {
   const logs = [];
   const { Hksv27Camera } = env.load(base + 'camera-hksv27.ts');
   const store = storage();
-  const camera = new Hksv27Camera(acc, {}, store, { ...quiet, log: m => logs.push(m), error: m => logs.push(m) }, {
+  const camera = new Hksv27Camera(acc, {}, store, { ...quiet, log: m => logs.push(m), warn: m => logs.push(m), error: m => logs.push(m) }, {
     sensorClass: '1080p', sensorWidth: 1920, sensorHeight: 1080,
     disabledServices: new Set(['Legacy Recording Config', 'Legacy RTP Live View']),
     ...options,
@@ -58,7 +60,7 @@ function write(svc, name, value) {
 }
 
 /** Runs the §4.13/§4.25/§4.26/§4.7 provisioning a controller performs before it asks for a clip. */
-async function provision(env, acc, authority, url, { withKey = true } = {}) {
+async function provision(env, acc, authority, url, { withKey = true, key = CAMERA_KEY } = {}) {
   const proto = env.load(base + 'hksv-recording-protocol.ts');
   const { tlvEncode } = env.load(base + 'hksv-stream-tiers.ts');
   const buffers = service(acc, proto.CameraBufferManagementServiceUUID);
@@ -80,7 +82,7 @@ async function provision(env, acc, authority, url, { withKey = true } = {}) {
     1, clientCertificateDer, 2, authority.caDer));
 
   if (withKey)
-    await write(keys, 'Camera Key', tlvEncode(1, CAMERA_KEY, 2, proto.u64(KEY_NUMBER)));
+    await write(keys, 'Camera Key', tlvEncode(1, key, 2, proto.u64(KEY_NUMBER)));
   return { buffers, certificates, keys, proto, tlvEncode };
 }
 
@@ -108,7 +110,11 @@ async function settle(predicate, why, timeout = 8000) {
   assert.fail(`timed out waiting for ${why}`);
 }
 
-async function uploadClip(t, { mode = 'cenc', pointOptions = {} } = {}) {
+/**
+ * Provisions an accessory, asks it for a Start-and-Stop upload of the whole buffered window,
+ * and waits until the clip is closed (its final manifest arrived) or the upload session ended.
+ */
+async function uploadClip(t, { mode = 'cenc', pointOptions = {}, key = CAMERA_KEY } = {}) {
   const env = environment({ realHap: true });
   const P = env.load(base + 'hksv-cmaf-protection.ts');
   const clip = recordedClip(P.readBoxes);
@@ -120,83 +126,148 @@ async function uploadClip(t, { mode = 'cenc', pointOptions = {} } = {}) {
   t.after(async () => { a.close(); await point.close(); authority.close(); });
 
   const { buffers, proto, tlvEncode } = await provision(env, a.acc, authority, url,
-    { withKey: mode === 'cenc' });
+    { withKey: mode === 'cenc', key });
   await settle(() => a.logs.some(l => String(l).includes('recording buffer ready')), 'the recorder to start');
   // The buffer refuses to open a window until it holds the init segment and some media.
   await settle(() => { try { a.camera.recordingBuffer.open(first); return true; } catch { return false; } },
     'the recording buffer to fill');
   // A Start-and-Stop upload of the whole buffered window, finalized (§4.9).
   const response = await write(buffers, 'Buffer Upload Command', tlvEncode(
-    1, proto.u64(7n), 2, 2, 3, proto.u64(first), 4, proto.u64(last), 5, 2));
+    1, proto.u64(SESSION_ID), 2, 2, 3, proto.u64(first), 4, proto.u64(last), 5, 2));
   const parsed = env.load(base + 'hksv-multitier-protocol.ts').tlvDecodeMap(response);
   const id = proto.readUIntLE(parsed[1]);
-  await settle(() => point.requests.some(r => r.name === '' && r.bytes > 0), 'the clip to be closed');
+  await settle(() => point.requests.filter(r => r.name === 'index.mpd' && r.session !== undefined
+      && point.objects.has(r.url)).length >= 2
+    || a.logs.some(l => /CMAF session \d+: HTTP \d+ for .*(bytes\)|nothing uploaded)/.test(String(l))
+      && !/HTTP 2\d\d/.test(String(l))),
+    'the clip to be closed or refused');
   return { env, P, point, clip, id, logs: a.logs, camera: a.camera, authority };
 }
 
-test('a provisioned accessory uploads an encrypted clip to a publishing point that demands its certificate',
+test('a provisioned accessory uploads an encrypted clip, one CMAF track at a time, to a publishing point that demands its certificate',
   { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
-    const { P, point, clip, id } = await uploadClip(t);
+    const { env, P, point, clip, id, logs } = await uploadClip(t);
+    const T = env.load(base + 'hksv-cmaf-tracks.ts');
 
-    const objects = point.requests.filter(r => r.bytes > 0 || r.name === '');
-    assert.equal(objects[0].name, '', 'the session opens with the DASH-IF connectivity probe');
-    assert.equal(objects[1].name, 'init.mp4', 'the CMAF Header is posted before any media');
-    assert.deepEqual(objects.slice(2, -1).map(r => r.name), ['1.m4s', '2.m4s', '3.m4s'],
-      'each fragment is one object, numbered in order');
-    assert.equal(objects[objects.length - 1].name, '', 'an empty mfra closes the clip');
-    for (const request of objects) {
+    // The Matter Push AV layout, in the reference camera's order: manifest, headers, segments, manifest.
+    const names = point.requests.map(r => r.name);
+    assert.equal(names[0], 'index.mpd', 'the manifest goes first, under the Clip ID');
+    assert.equal(point.requests[0].session, String(id));
+    assert.deepEqual(names.slice(1, 3), ['video.init', 'audio.init'], 'one CMAF Header per track follows');
+    assert.deepEqual(names.slice(3, -1),
+      ['segment_1001.m4s', 'segment_1001.m4s', 'segment_1002.m4s', 'segment_1002.m4s', 'segment_1003.m4s', 'segment_1003.m4s'],
+      'each fragment becomes one object per track, numbered from 1001');
+    assert.equal(names[names.length - 1], 'index.mpd', 'the complete manifest closes the clip');
+    for (const request of point.requests) {
+      assert.equal(request.method, 'PUT');
+      assert.equal(request.session, String(id), 'every object sits under the clip\'s session');
       // The plugin names its CSR after the accessory, so the far end sees which camera uploaded.
       assert.match(request.subject, /^scrypted-[0-9a-f]+$/, 'mutual TLS used the provisioned identity');
-      assert.equal(request.contentType, 'video/mp4');
+      assert.equal(request.contentType, request.name === 'index.mpd' ? 'application/dash+xml'
+        : request.name.endsWith('.init') ? 'video/mp4' : 'video/iso.segment');
       assert.match(request.userAgent, /^DASH-IF-Ingest\//);
     }
+    assert(logs.some(l => /accepted the manifest at \/pp\/session_\d+\/index\.mpd \(Clip ID \d+, PUT\)/.test(String(l))));
 
-    // The publishing point reassembles a CMAF Header whose tracks are marked protected...
-    const uploaded = point.clip(id);
-    const stsd = [];
-    (function walk(buf, start, end) {
-      for (const b of P.readBoxes(buf, start, end)) {
-        if (b.type === 'stsd') { stsd.push(b); continue; }
-        if (['moov', 'trak', 'mdia', 'minf', 'stbl'].includes(b.type)) walk(buf, b.start + b.headerSize, b.start + b.size);
+    // Each track reassembles into a CMAF Header marked protected plus its own media...
+    for (const name of ['video', 'audio']) {
+      const uploaded = point.track(id, name);
+      const stsd = [];
+      (function walk(buf, start, end) {
+        for (const b of P.readBoxes(buf, start, end)) {
+          if (b.type === 'stsd') { stsd.push(b); continue; }
+          if (['moov', 'trak', 'mdia', 'minf', 'stbl'].includes(b.type)) walk(buf, b.start + b.headerSize, b.start + b.size);
+        }
+      })(uploaded.init, 0, uploaded.init.length);
+      const formats = stsd.flatMap(s => P.readBoxes(uploaded.init, s.start + s.headerSize + 8, s.start + s.size).map(e => e.type));
+      assert.deepEqual(formats, [name === 'video' ? 'encv' : 'enca'], `${name} is a single common-encryption track`);
+      assert(P.readBoxes(uploaded.init)[0].type === 'ftyp');
+      assert.equal(uploaded.media.length, clip.fragments.length);
+      // ...and a holder of the Camera Key gets the recorder's exact samples back.
+      const plain = decryptClip(P, CAMERA_KEY, uploaded.media);
+      const expected = splitTracks(T, clip)[name];
+      for (const [i, fragment] of plain.entries()) {
+        const original = P.readBoxes(expected.media[i]).find(b => b.type === 'mdat');
+        assert.deepEqual(fragment.mdat,
+          expected.media[i].subarray(original.start + original.headerSize, original.start + original.size),
+          `${name} fragment ${i + 1} decrypts to the recorded media`);
       }
-    })(uploaded.init, 0, uploaded.init.length);
-    const formats = stsd.flatMap(s => P.readBoxes(uploaded.init, s.start + s.headerSize + 8, s.start + s.size).map(e => e.type));
-    assert.deepEqual(formats, ['encv', 'enca'], 'both tracks are common-encryption sample entries');
-    assert(P.readBoxes(uploaded.init)[0].type === 'ftyp');
-
-    // ...and a holder of the Camera Key gets the recorder's exact bytes back.
-    const plain = decryptClip(P, CAMERA_KEY, uploaded.media);
-    assert.equal(plain.length, clip.fragments.length);
-    for (const [i, fragment] of plain.entries()) {
-      const original = P.readBoxes(clip.fragments[i]).find(b => b.type === 'mdat');
-      assert.deepEqual(fragment.mdat,
-        clip.fragments[i].subarray(original.start + original.headerSize, original.start + original.size),
-        `fragment ${i + 1} decrypts to the recorded media`);
     }
+    // The manifest announces the protection and the objects' names.
+    const manifest = point.manifest(id);
+    assert.match(manifest, /cenc:default_KID="00000000-0000-0000-0000-00000000002a"/);
+    assert.match(manifest, /initialization="video\/video\.init" media="video\/segment_\$Number\$\.m4s" startNumber="1001"/);
+    assert.match(manifest, /initialization="audio\/audio\.init" media="audio\/segment_\$Number\$\.m4s" startNumber="1001"/);
+    assert.match(manifest, /codecs="hvc1\./);
+    assert.match(manifest, /codecs="mp4a\.40\.2"/);
   });
 
-test('an unprotected upload sends the recorder\'s own bytes, and a key is not required',
+test('an unprotected upload sends the recorder\'s own samples per track, and a key is not required',
   { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
-    const { P, point, clip, id } = await uploadClip(t, { mode: 'clear' });
-    const uploaded = point.clip(id);
-    for (const [i, fragment] of uploaded.media.entries()) {
-      // Only the styp the ingest adds separates the posted object from what the recorder made.
-      const boxes = P.readBoxes(fragment);
-      assert.equal(boxes[0].type, 'styp', 'each media object is a self-describing CMAF segment');
-      assert.deepEqual(fragment.subarray(boxes[0].size), clip.fragments[i], `fragment ${i + 1} is unmodified`);
+    const { env, P, point, clip, id } = await uploadClip(t, { mode: 'clear' });
+    const expected = splitTracks(env.load(base + 'hksv-cmaf-tracks.ts'), clip);
+    for (const name of ['video', 'audio']) {
+      const uploaded = point.track(id, name);
+      assert(!P.readBoxes(uploaded.init).some(b => b.type === 'senc'));
+      for (const [i, fragment] of uploaded.media.entries()) {
+        // Only the styp the ingest adds separates the object from the split recording.
+        const boxes = P.readBoxes(fragment);
+        assert.equal(boxes[0].type, 'styp', 'each media object is a self-describing CMAF segment');
+        assert.deepEqual(fragment.subarray(boxes[0].size), expected[name].media[i], `${name} fragment ${i + 1} is unmodified`);
+      }
     }
-    assert(!P.readBoxes(uploaded.init).some(b => b.type === 'senc'));
+    assert(!point.manifest(id).includes('ContentProtection'));
   });
 
-test('a publishing point that lost the CMAF Header gets it again and the fragment is retried',
+test('a publishing point that lost a CMAF Header gets it again and the fragment is retried',
   { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
-    // The first init POST fails, so the fragments that follow meet a point with no header: the
-    // 412 it answers with is the "HTTP Init Missing" the specification enumerates.
+    // The first header the point is given is forgotten, so the first video fragment meets a
+    // point with no header for its track: the 412 it answers with is the "HTTP Init Missing"
+    // the specification enumerates.
     const { point } = await uploadClip(t, { pointOptions: { failInitOnce: true } });
-    const names = point.requests.map(r => r.name);
-    assert.equal(names.filter(n => n === 'init.mp4').length, 2, 'the header is posted again');
-    assert(names.indexOf('1.m4s') < names.lastIndexOf('init.mp4'), 'the re-post follows the rejected fragment');
-    assert(names.lastIndexOf('1.m4s') > names.lastIndexOf('init.mp4'), 'and the fragment is retried after it');
+    const video = point.requests.filter(r => r.track === 'video').map(r => r.name);
+    assert.equal(video.filter(n => n === 'video.init').length, 2, 'the header is uploaded again');
+    assert(video.indexOf('segment_1001.m4s') < video.lastIndexOf('video.init'), 'the re-upload follows the rejected fragment');
+    assert(video.lastIndexOf('segment_1001.m4s') > video.lastIndexOf('video.init'), 'and the fragment is retried after it');
+    assert.equal(point.requests.filter(r => r.name === 'audio.init').length, 1, 'the other track is left alone');
+  });
+
+test('a publishing point keyed on the Session ID is found after the Clip ID is refused',
+  { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
+    const { point, id, logs } = await uploadClip(t, { mode: 'clear', pointOptions: { sessions: [SESSION_ID] } });
+    assert.notEqual(String(id), String(SESSION_ID));
+    const [first, second] = point.requests;
+    assert.deepEqual([first.name, first.session], ['index.mpd', String(id)], 'the manifest is offered under the Clip ID first');
+    assert.deepEqual([second.name, second.session], ['index.mpd', String(SESSION_ID)], 'then under the Session ID');
+    assert(point.requests.slice(1).every(r => r.session === String(SESSION_ID)), 'everything else follows the accepted layout');
+    assert(point.manifest(SESSION_ID)?.includes('<SegmentTimeline>'));
+    assert(logs.some(l => /HTTP 404 for \/pp\/session_\d+\/index\.mpd \(PUT, \d+ bytes\); offering the manifest under Session ID 7 instead/.test(String(l))),
+      'the refusal and the fallback are both logged');
+  });
+
+test('a publishing point that only allows POST gets it after a 405, and every refusal is logged with its body',
+  { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
+    const { point, logs } = await uploadClip(t, { mode: 'clear', pointOptions: { methods: ['POST'] } });
+    assert.equal(point.requests[0].method, 'PUT');
+    assert(point.requests.slice(1).every(r => r.method === 'POST'), 'the session stays on POST once the point asked for it');
+    assert(logs.some(l => /HTTP 405 for \/pp\/session_\d+\/index\.mpd — allow: POST; switching to POST/.test(String(l))));
+  });
+
+test('a publishing point that refuses every layout ends the session with HTTP Not Found and shows what it said',
+  { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
+    const { point, logs, camera, env } = await uploadClip(t, { mode: 'clear', pointOptions: {
+      refuse: { status: 404, headers: { 'content-type': 'application/json', 'x-apple-request-uuid': 'b70d84e3' },
+        body: '{"reason":"no such zone"}' } } });
+    assert.deepEqual(point.requests.map(r => r.name), ['index.mpd', 'index.mpd'], 'both layouts are offered, then nothing more');
+    const failure = logs.map(String).find(l => /^CMAF session 7: HTTP 404 for \/pp\/session_7\/index\.mpd/.test(l));
+    assert(failure, 'the terminal refusal is logged');
+    assert.match(failure, /content-type: application\/json; x-apple-request-uuid: b70d84e3; body: "\{"reason":"no such zone"\}"/);
+    const proto = env.load(base + 'hksv-recording-protocol.ts');
+    // The controller sees the §4.11 error: a CMAF Error event naming "HTTP Not Found" for the session.
+    const events = camera.eventQueue.query();
+    assert(events.some(e => e.type === proto.CameraBufferEventType.CMAF_ERROR && e.cmafSessionId === SESSION_ID
+      && e.error === proto.CmafError.HTTP_NOT_FOUND), `a CMAF Error event names HTTP Not Found: ${JSON.stringify(events,
+      (k, v) => typeof v === 'bigint' ? v.toString() : v)}`);
   });
 
 test('with upload off the accessory refuses the command and queues a CMAF Error', async t => {
@@ -214,6 +285,12 @@ test('with upload off the accessory refuses the command and queues a CMAF Error'
   assert(a.logs.some(l => String(l).includes('CMAF direct upload is off')),
     'the reason names the setting that turns it on');
 });
+
+test('a Camera Key that is not 16 bytes is called out when the upload starts',
+  { skip: pki.available() ? false : 'openssl is unavailable' }, async t => {
+    const { logs } = await uploadClip(t, { key: Buffer.alloc(32, 7) });
+    assert(logs.some(l => /the Camera Key is 32 bytes and the cenc reading assumes 16/.test(String(l))));
+  });
 
 test('cenc leaves every NAL header clear and never repeats an IV under one key', () => {
   const env = environment();
